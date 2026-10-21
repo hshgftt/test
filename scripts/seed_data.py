@@ -1,40 +1,26 @@
-"""
-Seed script — generates 操稳 (handling & stability) test data at scale.
+"""造演示数据 — 直接走导入器，和真实导入共用同一套规则。
 
-Two outputs:
-  1. Database (SQLite / PostgreSQL) — platforms / brands / vehicles /
-     conditions / experiments / indicators / curves
-  2. ``data/`` — JSON files, one folder per vehicle, one JSON per condition:
+生成内容
+========
 
-         data/极光EV-01/稳态回转.json
+* 车辆：平台 / 子平台、品牌 / 子品牌、车辆类型、生产日期、VIN、前后悬、
+  能源形式、驱动形式、所属部门、销售地；部分车辆带操稳单号（可多个）。
+* 试验模式：不同车辆模式数量不固定 —— 有的没有模式、有的只有「舒适」、
+  有的「舒适 + 运动」。
+* 数据：每个 (车 × 模式 × 工况) 一份，含多次实验 + 平均，指标 + 计算曲线 +
+  对齐曲线。曲线来自二阶系统物理模型，指标由同一组信号推导，二者自洽。
 
-     Each JSON has the shape::
+实现方式
+========
 
-         {"1": [params1, curves_cal1, curves_duiqi1],
-          "2": [params2, curves_cal2, curves_duiqi2],
-          "平均": [...]}
+物理信号 → 组装成 ``{实验号: [params, cal, duiqi]}`` → 交给
+``app.importer.import_items`` 写库。这样演示数据和真实导入走的是同一套
+解析/落库逻辑，不会出现「造数能查、导入查不到」的两套行为。
 
-Signals come from a physical 2nd-order step/pulse model, so every indicator
-is *derived from* its own curve — indicators and curves are self-consistent.
+用法::
 
-Scale
------
-Points are per-工况: 稳态回转 is the long one (10万点 by default), the rest
-are 5千~1万.  Everything is tunable::
-
-    python scripts/seed_data.py --preset full
-    python scripts/seed_data.py --vehicles 200 --conditions 20 \
-           --points 5000 --steady-points 100000
-    python scripts/seed_data.py --preset demo --no-json     # DB only
-
-Presets (vehicles × conditions × points / 稳态回转 points, 2 runs + 平均):
-
-    tiny      11 ×  5 ×   500 /   5000      ~10 MB    几秒
-    demo     200 × 20 ×  1000 /  10000      ~5 GB     几分钟
-    standard 200 × 20 ×  3000 /  30000      ~15 GB    十几分钟
-    full     200 × 20 ×  6000 / 100000      ~40 GB    三四十分钟
-
-Python 3.8 compatible (``typing.Dict/List/Optional`` only).
+    python scripts/seed_data.py --preset tiny
+    python scripts/seed_data.py --vehicles 20 --conditions 6 --points 500 --no-json
 """
 from __future__ import annotations
 
@@ -44,20 +30,16 @@ import math
 import os
 import random
 import re
-import shutil
 import sys
 import time
+from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-
-from app.config import DATABASE_URL, IS_SQLITE
-from app.database import SessionLocal, engine
+from app import importer
+from app.database import SessionLocal
 
 # ── optional numpy fast path ──────────────────────────────────────────
-# 10万点 × 7通道 × (原始+滤波+平均) 在纯 Python 下每秒只能处理几万个数，
-# numpy 能把信号生成/平滑/取整/平均整体提速 5~10 倍。没有 numpy 也能跑。
 try:
     import numpy as _np
 except Exception:                                    # pragma: no cover
@@ -65,27 +47,15 @@ except Exception:                                    # pragma: no cover
 
 HAS_NUMPY = _np is not None
 
-from app.models import (
-    Base,
-    Brand,
-    Condition,
-    Curve,
-    Experiment,
-    Indicator,
-    Platform,
-    Vehicle,
-)
-
-# ── project paths ──────────────────────────────────────────────────────
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(ROOT, "data")
+DATASET_TYPE = "handling_stability"
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 1. 工况 (conditions) — 20 个，按信号族分类，每个工况独立采样点数
+# 1. 工况
 # ═══════════════════════════════════════════════════════════════════════
 
-# family: step(阶跃) / pulse(脉冲) / steady(稳态) / ret(回正) / slalom(蛇行)
 CONDITION_SPECS: List[Dict[str, Any]] = [
     {"name": "角阶跃",        "family": "step",   "pts": 6000,  "dt": 0.005, "cat": "操稳试验",
      "desc": "方向盘角阶跃输入试验（转向盘转角阶跃）"},
@@ -129,11 +99,11 @@ CONDITION_SPECS: List[Dict[str, Any]] = [
      "desc": "弯道制动稳定性试验"},
 ]
 
-STEADY_CONDITION = "稳态回转"      # 10 万点那个
+STEADY_CONDITION = "稳态回转"
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 2. 指标模板 — 每个信号族一组 (name, unit)，按工况重新编号
+# 2. 指标模板
 # ═══════════════════════════════════════════════════════════════════════
 
 FAMILY_TEMPLATES: Dict[str, List[Tuple[str, Optional[str]]]] = {
@@ -198,49 +168,27 @@ CURVE_DEFS: List[Tuple[str, str, str, str, bool]] = [
 # 4. helpers
 # ═══════════════════════════════════════════════════════════════════════
 
-def parse_raw_key(raw_key: str):
-    """raw_key → ``(seq, name, unit)``.
-
-    算法侧的 key **不一定带数字前缀**，所以要兼容三类写法::
-
-        '13-侧向加速度稳态值(g)'   → (13,  '侧向加速度稳态值', 'g')
-        '13-侧向加速度稳态值'      → (13,  '侧向加速度稳态值', None)
-        '侧向加速度稳态值(g)'      → (None,'侧向加速度稳态值', 'g')
-        '侧向加速度稳态值'         → (None,'侧向加速度稳态值', None)
-
-    注意 ``seq`` 只是数字前缀的拆解产物，**不要拿它跨工况排序**：
-    同一个指标在不同工况下编号完全不同（「车速」角阶跃=10 / 角脉冲=100），
-    且编号本身不唯一（17 重复）。排序请用 ``name``。
-    """
-    seq = None
+def parse_raw_key(raw_key: str) -> Tuple[Optional[int], str, Optional[str]]:
+    seq: Optional[int] = None
     body = raw_key
-
-    # ① 可选数字前缀（兼容 '13-' / '13.' / '13_' 三种分隔符）
     m = re.match(r"^\s*(\d+)\s*[-._、]\s*(.+)$", raw_key)
     if m:
         seq = int(m.group(1))
         body = m.group(2)
-
-    # ② 可选单位后缀（取最外层括号，支持括号里有括号）
     unit = None
     m = re.match(r"^(.*?)\(([^()]+)\)\s*$", body)
     if m:
         body = m.group(1)
         unit = m.group(2).strip()
-
-    name = body.strip()
-    # 极端情况：key 本身是空的，拿原文兜底，避免 name 为空串
-    if not name:
-        name = raw_key.strip()
+    name = body.strip() or raw_key.strip()
     return seq, name, unit or None
 
 
-def r2(v) -> float:
+def r2(v: float) -> float:
     return round(float(v), 4)
 
 
-def r2list(vals) -> List[float]:
-    """Round a channel to 4 decimals — vectorised when numpy is present."""
+def r2list(vals: List[float]) -> List[float]:
     if HAS_NUMPY:
         return _np.round(_np.asarray(vals, dtype="float64"), 4).tolist()
     return [r2(v) for v in vals]
@@ -252,7 +200,7 @@ def time_base(n: int, dt: float) -> List[float]:
     return [round(i * dt, 6) for i in range(n)]
 
 
-def step_response(t, t_start, amp, zeta, wn):
+def step_response(t: List[float], t_start: float, amp: float, zeta: float, wn: float) -> List[float]:
     if zeta >= 1:
         zeta = 0.999
     wd = wn * math.sqrt(1 - zeta * zeta)
@@ -264,42 +212,35 @@ def step_response(t, t_start, amp, zeta, wn):
         out = amp * (1 - env * (_np.cos(wd * tt) + k * _np.sin(wd * tt)))
         out = _np.where(ta < t_start, 0.0, out)
         return out.tolist()
-    out = []
-    ap = out.append
+    out: List[float] = []
     for ti in t:
         if ti < t_start:
-            ap(0.0)
+            out.append(0.0)
         else:
             tt = ti - t_start
             env = math.exp(-zeta * wn * tt)
-            ap(amp * (1 - env * (math.cos(wd * tt) + k * math.sin(wd * tt))))
+            out.append(amp * (1 - env * (math.cos(wd * tt) + k * math.sin(wd * tt))))
     return out
 
 
-def smooth(vals, window=3):
+def smooth(vals: List[float], window: int = 3) -> List[float]:
     if HAS_NUMPY:
         a = _np.asarray(vals, dtype="float64")
         pad = window // 2
         if pad:
             a = _np.pad(a, (pad, pad), mode="edge")
-        kern = _np.ones(window, dtype="float64") / window
-        return _np.convolve(a, kern, mode="valid").tolist()
+        return _np.convolve(a, _np.ones(window) / window, mode="valid").tolist()
     n = len(vals)
     half = window // 2
-    out = []
-    ap = out.append
+    out: List[float] = []
     for i in range(n):
-        lo = i - half
-        if lo < 0:
-            lo = 0
-        hi = i + half + 1
-        if hi > n:
-            hi = n
-        ap(sum(vals[lo:hi]) / (hi - lo))
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        out.append(sum(vals[lo:hi]) / (hi - lo))
     return out
 
 
-def deriv(vals, dt):
+def deriv(vals: List[float], dt: float) -> List[float]:
     if HAS_NUMPY:
         a = _np.asarray(vals, dtype="float64")
         out = _np.empty_like(a)
@@ -307,24 +248,21 @@ def deriv(vals, dt):
         out[1:] = (a[1:] - a[:-1]) / dt
         return out.tolist()
     out = [0.0]
-    ap = out.append
     inv = 1.0 / dt
     for i in range(1, len(vals)):
-        ap((vals[i] - vals[i - 1]) * inv)
+        out.append((vals[i] - vals[i - 1]) * inv)
     return out
 
 
-def noise(vals, amp, rng):
+def noise(vals: List[float], amp: float, rng: random.Random) -> List[float]:
     if HAS_NUMPY:
         a = _np.asarray(vals, dtype="float64")
         sub = _np.random.default_rng(rng.randrange(2 ** 32))
         return (a + sub.normal(0.0, amp, a.shape)).tolist()
-    g = rng.gauss
-    return [v + g(0, amp) for v in vals]
+    return [v + rng.gauss(0, amp) for v in vals]
 
 
 def mean_curves(arrays: List[List[float]]) -> List[float]:
-    """Element-wise mean across runs (used to build the 平均 curve)."""
     if HAS_NUMPY:
         stacked = _np.vstack([_np.asarray(a, dtype="float64") for a in arrays])
         return _np.round(stacked.mean(axis=0), 4).tolist()
@@ -332,7 +270,7 @@ def mean_curves(arrays: List[List[float]]) -> List[float]:
     return [r2(sum(a[i] for a in arrays) / len(arrays)) for i in range(n)]
 
 
-def time_to_pct(t, y, t_start, pct, steady):
+def time_to_pct(t: List[float], y: List[float], t_start: float, pct: float, steady: float) -> float:
     target = pct * steady
     for i, ti in enumerate(t):
         if ti >= t_start and y[i] >= target:
@@ -340,7 +278,7 @@ def time_to_pct(t, y, t_start, pct, steady):
     return 0.0
 
 
-def peak_info(t, y, t_start):
+def peak_info(t: List[float], y: List[float], t_start: float) -> Tuple[float, float]:
     pk_v, pk_t = -1e18, t_start
     for i, ti in enumerate(t):
         if ti >= t_start and y[i] > pk_v:
@@ -348,12 +286,12 @@ def peak_info(t, y, t_start):
     return pk_t, pk_v
 
 
-def amp_of(vals) -> float:
+def amp_of(vals: List[float]) -> float:
     return (max(vals) - min(vals)) / 2.0
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 5. 指标 raw_key 生成（按工况分配序号段，保证 raw_key 全局语义唯一）
+# 5. 指标 raw_key
 # ═══════════════════════════════════════════════════════════════════════
 
 def build_condition_indices(specs: List[Dict[str, Any]]) -> None:
@@ -365,23 +303,21 @@ def build_condition_indices(specs: List[Dict[str, Any]]) -> None:
             keys.append("%d-%s(%s)" % (seq + i, nm, unit) if unit
                         else "%d-%s" % (seq + i, nm))
         spec["indices"] = keys
-        # 下一个工况从下一个整十段开始，避免序号交错
         seq = ((seq + len(tmpl)) // 10 + 1) * 10
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 6. signal generation
+# 6. 信号生成
 # ═══════════════════════════════════════════════════════════════════════
 
-def gen_signals(spec: Dict[str, Any], veh: dict, rng: random.Random) -> dict:
-    """Generate raw + filtered channels for one run."""
+def gen_signals(spec: Dict[str, Any], veh: Dict[str, Any], rng: random.Random) -> Dict[str, Any]:
     family = spec["family"]
     n = spec["pts"]
     dt = spec["dt"]
     name = spec["name"]
 
     t = time_base(n, dt)
-    mass = veh.get("extra_attrs", {}).get("mass", 1800)
+    mass = veh.get("mass", 1800)
     awd = veh.get("drive_type") == "四驱"
 
     if "高速" in name:
@@ -390,8 +326,6 @@ def gen_signals(spec: Dict[str, Any], veh: dict, rng: random.Random) -> dict:
         speed = 40.0
     elif family == "slalom":
         speed = 60.0
-    elif family == "steady":
-        speed = 80.0
     else:
         speed = 80.0
 
@@ -399,14 +333,13 @@ def gen_signals(spec: Dict[str, Any], veh: dict, rng: random.Random) -> dict:
         t0, t_rise = 0.5, 0.15
         swa_max = round(rng.uniform(45, 75), 2)
         swa = []
-        ap = swa.append
         for ti in t:
             if ti < t0:
-                ap(0.0)
+                swa.append(0.0)
             elif ti < t0 + t_rise:
-                ap(swa_max * (ti - t0) / t_rise)
+                swa.append(swa_max * (ti - t0) / t_rise)
             else:
-                ap(swa_max)
+                swa.append(swa_max)
     elif family == "pulse":
         t0, pw = 0.5, 0.35
         swa_max = round(rng.uniform(50, 90), 2)
@@ -420,15 +353,14 @@ def gen_signals(spec: Dict[str, Any], veh: dict, rng: random.Random) -> dict:
         t0, t_release = 0.5, 2.0
         swa_max = round(rng.uniform(50, 80), 2)
         swa = []
-        ap = swa.append
         for ti in t:
             if ti < t0:
-                ap(0.0)
+                swa.append(0.0)
             elif ti < t_release:
-                ap(swa_max * min((ti - t0) / 0.8, 1.0))
+                swa.append(swa_max * min((ti - t0) / 0.8, 1.0))
             else:
-                ap(swa_max * max(0.0, 1 - (ti - t_release) / 0.7))
-    else:  # slalom
+                swa.append(swa_max * max(0.0, 1 - (ti - t_release) / 0.7))
+    else:
         t0, f = 0.0, 0.5
         swa_max = round(rng.uniform(60, 110), 2)
         swa = [swa_max * math.sin(2 * math.pi * f * ti) for ti in t]
@@ -486,18 +418,13 @@ def gen_signals(spec: Dict[str, Any], veh: dict, rng: random.Random) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 7. indicator computation (derived from the signals themselves)
+# 7. 指标计算
 # ═══════════════════════════════════════════════════════════════════════
 
-def compute_values(sig: dict, rng: random.Random) -> Dict[str, float]:
-    """Physical indicator values keyed by *name* (not by raw_key).
-
-    The caller maps these names onto the condition's own raw_keys, so one
-    piece of physics serves all 20 工况.
-    """
+def compute_values(sig: Dict[str, Any], rng: random.Random) -> Dict[str, float]:
     t, t0, dt = sig["t"], sig["t0"], sig["dt"]
     family = sig["family"]
-    filt = sig["filt"]          # 滤波后的通道（seed 里算一次，此处复用）
+    filt = sig["filt"]
     p: Dict[str, float] = {}
 
     ay = filt["侧向加速度"]
@@ -507,7 +434,7 @@ def compute_values(sig: dict, rng: random.Random) -> Dict[str, float]:
     rr = filt["侧倾角速度"]
     ra = sig["rollacc"]
     tail = max(15, len(t) // 100)
-    avg_tail = lambda v: sum(v[-tail:]) / float(tail)
+    avg_tail = lambda v: sum(v[-tail:]) / float(tail)  # noqa: E731
 
     ay_s = avg_tail(ay)
     avz_s = avg_tail(avz)
@@ -591,7 +518,7 @@ def compute_values(sig: dict, rng: random.Random) -> Dict[str, float]:
         p["回正响应时间"] = rng.uniform(0.25, 0.8)
         p["方向盘回正残余角"] = abs(swa[-1])
 
-    else:  # slalom
+    else:
         a_swa = amp_of(swa)
         a_avz = amp_of(avz)
         a_ay = amp_of(ay)
@@ -612,7 +539,6 @@ def compute_values(sig: dict, rng: random.Random) -> Dict[str, float]:
 
 
 def synth_by_unit(unit: Optional[str], rng: random.Random) -> float:
-    """Fallback value when a name has no physics behind it."""
     if unit in ("g", "g/deg"):
         return rng.uniform(0.2, 0.8)
     if unit == "%":
@@ -628,7 +554,7 @@ def synth_by_unit(unit: Optional[str], rng: random.Random) -> float:
     return rng.uniform(0.5, 20.0)
 
 
-def build_params(spec: Dict[str, Any], sig: dict, rng: random.Random) -> Dict[str, float]:
+def build_params(spec: Dict[str, Any], sig: Dict[str, Any], rng: random.Random) -> Dict[str, float]:
     values = compute_values(sig, rng)
     out: Dict[str, float] = {}
     for raw_key in spec["indices"]:
@@ -638,28 +564,22 @@ def build_params(spec: Dict[str, Any], sig: dict, rng: random.Random) -> Dict[st
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 8. curve assembly
+# 8. 曲线组装
 # ═══════════════════════════════════════════════════════════════════════
 
-def filter_channels(sig: dict) -> Dict[str, Tuple[List[float], List[float]]]:
-    """Return {channel: (rounded origin, rounded filter)} — rounded ONCE.
-
-    Rounding once per channel (instead of once per curve/series) is what makes
-    10万点 × 7 通道 affordable.
-    """
-    out: Dict[str, Tuple[List[float], List[float]]] = {}
-    for k, v in sig["chans"].items():
-        out[k] = (r2list(v), r2list(sig["filt"][k]))
-    return out
+def filter_channels(sig: Dict[str, Any]) -> Dict[str, Tuple[List[float], List[float]]]:
+    return {k: (r2list(v), r2list(sig["filt"][k])) for k, v in sig["chans"].items()}
 
 
-def build_curves(t_r: List[float], chans_r: Dict[str, Tuple[List[float], List[float]]],
-                 duiqi: bool = False) -> Dict[str, dict]:
-    """x is shared by every curve and every series (same list object)."""
-    out: Dict[str, dict] = {}
+def build_curves(
+    t_r: List[float],
+    chans_r: Dict[str, Tuple[List[float], List[float]]],
+    duiqi: bool = False,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
     for cname, title, xl, yl, has_raw in CURVE_DEFS:
         chan = chans_r[cname.split("-")[0]]
-        series: List[dict] = []
+        series: List[Dict[str, Any]] = []
         if not duiqi:
             series.append({"x": t_r, "y": chan[0],
                            "curvetype": "line", "curvename": "原始数据"})
@@ -673,10 +593,10 @@ def build_curves(t_r: List[float], chans_r: Dict[str, Tuple[List[float], List[fl
     return out
 
 
-def average_curves(curve_list: List[Dict[str, dict]]) -> Dict[str, dict]:
-    out: Dict[str, dict] = {}
+def average_curves(curve_list: List[Dict[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
     for k in curve_list[0]:
-        ser: List[dict] = []
+        ser: List[Dict[str, Any]] = []
         for si in range(len(curve_list[0][k]["curve"])):
             xs = curve_list[0][k]["curve"][si]["x"]
             ys = mean_curves([cl[k]["curve"][si]["y"] for cl in curve_list])
@@ -699,64 +619,130 @@ def average_params(param_list: List[Dict[str, float]]) -> Dict[str, float]:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 9. dimension generation (200 台车)
+# 9. 车辆
 # ═══════════════════════════════════════════════════════════════════════
 
-PLATFORM_BRANDS: List[Tuple[str, str, List[str]]] = [
-    ("BEV平台", "EV", ["极光", "星河", "雷霆"]),
-    ("PHEV平台", "PHEV", ["混动先锋", "绿动"]),
-    ("ICE平台", "ICE", ["经典动力", "锐驰"]),
-    ("氢燃料平台", "H2", ["蓝氢"]),
+# 平台 → (子平台列表, 品牌列表)
+PLATFORM_SPECS: List[Tuple[str, List[str], List[str]]] = [
+    ("BEV平台", ["E1平台", "E2平台"], ["星河", "极光", "雷霆"]),
+    ("PHEV平台", ["P1平台"], ["混动先锋", "绿动"]),
+    ("ICE平台", [], ["经典动力", "锐驰"]),
+    ("氢燃料平台", [], ["蓝氢"]),
 ]
 
+SUB_BRANDS = {"星河": ["星河智电", "星河出行"], "极光": ["极光性能"]}
+MODES = [(), ("舒适",), ("舒适", "运动")]
+VEHICLE_TYPES = ["轿车", "SUV", "MPV", "跑车"]
 DRIVE_TYPES = ["四驱", "后驱", "前驱"]
-BATTERIES = ["宁德时代80kWh", "比亚迪刀片70kWh", "磷酸铁锂60kWh", "三元锂90kWh"]
-MOTORS = ["双电机", "单电机", "增程器+单电机"]
+ENERGY_BY_PLATFORM = {
+    "BEV平台": "纯电",
+    "PHEV平台": "插电混动",
+    "ICE平台": "燃油",
+    "氢燃料平台": "氢燃料",
+}
+FRONT_SUSP = ["麦弗逊", "双叉臂", "多连杆"]
+REAR_SUSP = ["多连杆", "扭力梁", "整体桥", "双叉臂"]
+DEPARTMENTS = ["整车试验部", "底盘调校部", "性能开发部"]
+REGIONS = ["中国", "欧洲", "中东", "东南亚"]
 
 
-def build_vehicles(n: int, rng: random.Random) -> List[dict]:
-    """Round-robin n vehicles across platforms × brands."""
-    brands = [(plat, tag, br) for plat, tag, brs in PLATFORM_BRANDS for br in brs]
-    out: List[dict] = []
+def build_vehicles(n: int) -> List[Dict[str, Any]]:
+    combos = [
+        (plat, sub, br)
+        for plat, subs, brs in PLATFORM_SPECS
+        for sub in (subs or [""])
+        for br in brs
+    ]
+    out: List[Dict[str, Any]] = []
     counters: Dict[Tuple[str, str], int] = {}
     for i in range(n):
-        plat, tag, br = brands[i % len(brands)]
-        key = (plat, br)
-        counters[key] = counters.get(key, 0) + 1
-        idx = counters[key]
-        out.append({
+        plat, sub, br = combos[i % len(combos)]
+        counters[(plat, br)] = counters.get((plat, br), 0) + 1
+        idx = counters[(plat, br)]
+        code = {"BEV平台": "EV", "PHEV平台": "PHEV",
+                "ICE平台": "ICE", "氢燃料平台": "H2"}[plat]
+        name = "%s%s-%02d" % (br, code, idx)
+
+        subs = SUB_BRANDS.get(br, [])
+        sub_brand = subs[i % len(subs)] if subs else None
+        modes = list(MODES[i % len(MODES)])
+        orders = ["CS-2024-%03d" % (i + 1)]
+        if i % 7 == 0:
+            orders.append("CS-2024-%03d-B" % (i + 1))
+
+        attrs: Dict[str, Any] = {
             "platform": plat,
             "brand": br,
-            "name": "%s%s-%02d" % (br, tag, idx),
+            "vehicle_type": VEHICLE_TYPES[i % len(VEHICLE_TYPES)],
+            "production_date": "2024-%02d-%02d" % (i % 12 + 1, i % 28 + 1),
+            "model_year": 2023 + (i % 3),
+            "vin": "LJV%08d" % (i + 1),
+            "front_suspension": FRONT_SUSP[i % len(FRONT_SUSP)],
+            "rear_suspension": REAR_SUSP[i % len(REAR_SUSP)],
+            "energy_type": ENERGY_BY_PLATFORM[plat],
             "drive_type": DRIVE_TYPES[i % len(DRIVE_TYPES)],
-            "vin": "LJV%06d" % (i + 1),
-            "model_year": 2022 + (i % 4),
-            "extra_attrs": {
-                "battery": BATTERIES[i % len(BATTERIES)],
-                "motor": MOTORS[i % len(MOTORS)],
-                "mass": 1650 + (i * 37) % 750,
-            },
+            "department": DEPARTMENTS[i % len(DEPARTMENTS)],
+            "sales_region": REGIONS[i % len(REGIONS)],
+        }
+        if sub:
+            attrs["sub_platform"] = sub
+        if sub_brand:
+            attrs["sub_brand"] = sub_brand
+
+        out.append({
+            "name": name,
+            "attrs": attrs,
+            "modes": modes,
+            "orders": [{"discipline": "操稳", "order_no": o} for o in orders],
+            "folder_order": orders[0],
+            "drive_type": attrs["drive_type"],
+            "mass": 1650 + (i * 37) % 750,
         })
-        _ = rng
     return out
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 10. main seed
+# 10. 单份数据的实验结构
 # ═══════════════════════════════════════════════════════════════════════
 
-def seed(args) -> None:
+def build_experiments(
+    spec: Dict[str, Any], veh: Dict[str, Any], runs: int, rng: random.Random,
+) -> Dict[str, Any]:
+    param_list: List[Dict[str, float]] = []
+    cal_list: List[Dict[str, Any]] = []
+    dui_list: List[Dict[str, Any]] = []
+
+    for _ in range(runs):
+        sig = gen_signals(spec, veh, rng)
+        sig["filt"] = {k: smooth(v, 3) for k, v in sig["chans"].items()}
+        chans_r = filter_channels(sig)
+        t_r = r2list(sig["t"])
+        param_list.append(build_params(spec, sig, rng))
+        cal_list.append(build_curves(t_r, chans_r, duiqi=False))
+        dui_list.append(build_curves(t_r, chans_r, duiqi=True))
+
+    param_list.append(average_params(param_list))
+    cal_list.append(average_curves(cal_list))
+    dui_list.append(average_curves(dui_list))
+
+    experiments: Dict[str, Any] = {}
+    for i in range(runs):
+        experiments[str(i + 1)] = [param_list[i], cal_list[i], dui_list[i]]
+    experiments["平均"] = [param_list[-1], cal_list[-1], dui_list[-1]]
+    return experiments
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 11. main
+# ═══════════════════════════════════════════════════════════════════════
+
+def seed(args: Any) -> None:
     rng = random.Random(args.seed)
     t_start = time.time()
 
-    # ── 工况 spec 处理 ──
-    # 先按【完整 20 个工况】分配序号段，这样不论 --conditions 取几个，
-    # 同一个工况的 raw_key 始终是固定的（例如 稳态回转 永远是 160-169）。
     specs = [dict(s) for s in CONDITION_SPECS]
     build_condition_indices(specs)
-
     if args.conditions and args.conditions < len(specs):
-        # 保留 稳态回转，其余取前 N-1 个
         head = [s for s in specs if s["name"] != STEADY_CONDITION][: args.conditions - 1]
         steady = [s for s in specs if s["name"] == STEADY_CONDITION]
         specs = head + steady
@@ -769,175 +755,92 @@ def seed(args) -> None:
             if s["name"] == STEADY_CONDITION:
                 s["pts"] = args.steady_points
 
-    vehicles = build_vehicles(args.vehicles, rng)
-    runs = args.runs
+    vehicles = build_vehicles(args.vehicles)
+    runs = max(1, args.runs)
 
-    print("Resetting database …")
-    # SQLite drop_all 后文件不会缩小，重建时越跑越慢 —— 直接删文件（seed 本就是全量重建）
-    if IS_SQLITE:
-        engine.dispose()
-        _path = DATABASE_URL.split("///", 1)[-1]
-        for _p in (_path, _path + "-wal", _path + "-shm"):
-            if os.path.exists(_p):
-                os.remove(_p)
-    Base.metadata.drop_all(bind=engine)
-    Base.metadata.create_all(bind=engine)
-
+    if args.json and os.path.isdir(DATA_DIR):
+        import shutil
+        shutil.rmtree(DATA_DIR)
     if args.json:
-        if os.path.isdir(DATA_DIR):
-            shutil.rmtree(DATA_DIR)
         os.makedirs(DATA_DIR, exist_ok=True)
 
+    print("重建数据库（清空全部数据 + 写入默认元数据）…")
+    importer.reset_schema()
+
     db = SessionLocal()
+    n_exp = n_ind = n_cur = n_pts = 0
     try:
-        # ── platforms / brands / vehicles ──
-        plat_objs: Dict[str, Platform] = {}
-        brand_objs: Dict[Tuple[str, str], Brand] = {}
-        veh_objs: List[Vehicle] = []
+        for vi, veh in enumerate(vehicles, start=1):
+            items: List[Dict[str, Any]] = []
+            modes: List[Optional[str]] = list(veh["modes"]) or [None]
 
-        for v in vehicles:
-            plat = plat_objs.get(v["platform"])
-            if plat is None:
-                plat = Platform(name=v["platform"])
-                db.add(plat)
-                db.flush()
-                plat_objs[v["platform"]] = plat
-            bkey = (v["platform"], v["brand"])
-            brand = brand_objs.get(bkey)
-            if brand is None:
-                brand = Brand(name=v["brand"], platform_id=plat.id)
-                db.add(brand)
-                db.flush()
-                brand_objs[bkey] = brand
-            veh = Vehicle(
-                name=v["name"], brand_id=brand.id, drive_type=v["drive_type"],
-                vin=v["vin"], model_year=v["model_year"], extra_attrs=v["extra_attrs"],
+            for mode in modes:
+                for spec in specs:
+                    experiments = build_experiments(spec, veh, runs, rng)
+                    items.append({
+                        "vehicle": veh["name"],
+                        "folder_order": veh["folder_order"],
+                        "mode": mode,
+                        "condition": spec["name"],
+                        "file": "%s/%s/%s.json" % (
+                            veh["name"], mode or "", spec["name"]),
+                        "dataset_type": DATASET_TYPE,
+                        "kind": "experiments",
+                        "experiments": importer.parse_payload(experiments),
+                        "payload": None,
+                    })
+                    if args.json:
+                        _write_json(veh["name"], veh["folder_order"], mode, spec["name"], experiments)
+
+            vmeta = {veh["name"]: {
+                "attrs": veh["attrs"],
+                "modes": veh["modes"],
+                "orders": veh["orders"],
+            }}
+            stats = importer.import_items(
+                db, items, vmeta, {}, append=True,
             )
-            db.add(veh)
-            veh_objs.append(veh)
-        db.commit()
-        for v in veh_objs:
-            db.refresh(v, ["id"])
+            n_exp += stats["datasets"]
+            n_ind += stats["indicators"]
+            n_cur += stats["curves"]
+            n_pts += stats["points"]
 
-        # ── conditions ──
-        cond_objs: Dict[str, Condition] = {}
-        for s in specs:
-            c = Condition(name=s["name"], description=s["desc"], category=s["cat"])
-            db.add(c)
-            cond_objs[s["name"]] = c
-        db.commit()
-        for c in cond_objs.values():
-            db.refresh(c, ["id"])
-
-        total_exp = total_ind = total_cur = 0
-        total_bytes = 0
-
-        for vi, (v, veh_obj) in enumerate(zip(vehicles, veh_objs), start=1):
-            veh_dir = os.path.join(DATA_DIR, v["name"])
-            if args.json:
-                os.makedirs(veh_dir, exist_ok=True)
-
-            for s in specs:
-                cond_obj = cond_objs[s["name"]]
-
-                param_list: List[Dict[str, float]] = []
-                cal_list: List[Dict[str, dict]] = []
-                dui_list: List[Dict[str, dict]] = []
-
-                for run_i in range(1, runs + 1):
-                    sig = gen_signals(s, v, rng)
-                    sig["filt"] = {k: smooth(vv, 3) for k, vv in sig["chans"].items()}
-                    chans_r = filter_channels(sig)
-                    t_r = r2list(sig["t"])
-                    param_list.append(build_params(s, sig, rng))
-                    cal_list.append(build_curves(t_r, chans_r, duiqi=False))
-                    dui_list.append(build_curves(t_r, chans_r, duiqi=True))
-                    del sig, chans_r
-
-                # ── 平均 ──
-                param_list.append(average_params(param_list))
-                cal_list.append(average_curves(cal_list))
-                dui_list.append(average_curves(dui_list))
-
-                # ── 落 JSON: {"1":[p,cal,dui], ..., "平均":[...]} ──
-                if args.json:
-                    payload: Dict[str, Any] = {}
-                    for i in range(runs):
-                        payload[str(i + 1)] = [param_list[i], cal_list[i], dui_list[i]]
-                    payload["平均"] = [param_list[-1], cal_list[-1], dui_list[-1]]
-                    fpath = os.path.join(veh_dir, "%s.json" % s["name"])
-                    with open(fpath, "w", encoding="utf-8") as fh:
-                        json.dump(payload, fh, ensure_ascii=False)
-                    total_bytes += os.path.getsize(fpath)
-                    payload = None
-
-                # ── 入库 ──
-                for i in range(runs + 1):
-                    no = "平均" if i == runs else str(i + 1)
-                    exp = Experiment(
-                        vehicle_id=veh_obj.id, condition_id=cond_obj.id,
-                        experiment_no=no, is_average=(i == runs),
-                        sort_order=999 if i == runs else i,
-                    )
-                    db.add(exp)
-                    db.flush()
-                    total_exp += 1
-
-                    params = param_list[i]
-                    # seq 不再入库（见 models.Indicator），只取 name / unit
-                    db.add_all([
-                        Indicator(
-                            experiment_id=exp.id,
-                            name=parse_raw_key(rk)[1], unit=parse_raw_key(rk)[2],
-                            raw_key=rk, value=val, category=s["cat"],
-                        )
-                        for rk, val in params.items()
-                    ])
-                    total_ind += len(params)
-
-                    for group, cdict in (("cal", cal_list[i]), ("duiqi", dui_list[i])):
-                        for order, (ckey, cval) in enumerate(cdict.items()):
-                            npts = len(cval["curve"][0]["x"])
-                            db.add(Curve(
-                                experiment_id=exp.id, group=group, name=ckey,
-                                title=cval["title"], xlabel=cval["xlabel"],
-                                ylabel=cval["ylabel"], series=cval["curve"],
-                                point_count=npts, sort_order=order,
-                            ))
-                            total_cur += 1
-
-                param_list = cal_list = dui_list = None   # free memory
-                db.commit()
-
-            if vi % max(1, args.vehicles // 20) == 0 or vi == args.vehicles:
-                el = time.time() - t_start
-                print("  [%3d/%d 车] %6.1fs  实验 %d  指标 %d  曲线 %d"
-                      % (vi, args.vehicles, el, total_exp, total_ind, total_cur))
-
+            items = []
+            if vi % max(1, len(vehicles) // 20) == 0 or vi == len(vehicles):
+                print("  [%3d/%d 车] %6.1fs  数据集 %d  指标 %d  曲线 %d"
+                      % (vi, len(vehicles), time.time() - t_start,
+                         n_exp, n_ind, n_cur))
     finally:
         db.close()
 
     print("\nSeed complete  (%.1fs)" % (time.time() - t_start))
-    print("  Platforms   : %d" % len(plat_objs))
-    print("  Brands      : %d" % len(brand_objs))
-    print("  Vehicles    : %d" % len(vehicles))
+    print("  Vehicles    : %d（模式组合：%s）"
+          % (len(vehicles), " / ".join("/".join(v["modes"]) or "无模式" for v in vehicles[:3]) + " …"))
     print("  Conditions  : %d" % len(specs))
-    print("  Experiments : %d" % total_exp)
-    print("  Indicators  : %d" % total_ind)
-    print("  Curves      : %d" % total_cur)
+    print("  Datasets    : %d" % n_exp)
+    print("  Indicators  : %d" % n_ind)
+    print("  Curves      : %d" % n_cur)
+    print("  Points      : %s" % "{:,}".format(n_pts))
     if args.json:
-        n_files = sum(len(fs) for _, _, fs in os.walk(DATA_DIR))
-        print("  JSON files  : %d  →  %s  (%.2f GB)"
-              % (n_files, DATA_DIR, total_bytes / 1024 ** 3))
-    if IS_SQLITE:
-        path = DATABASE_URL.split("///", 1)[-1]
-        if os.path.exists(path):
-            print("  DB file     : %s  (%.2f GB)"
-                  % (path, os.path.getsize(path) / 1024 ** 3))
+        print("  JSON files  : %s" % DATA_DIR)
+
+
+def _write_json(
+    name: str, order: Optional[str], mode: Optional[str],
+    condition: str, experiments: Dict[str, Any],
+) -> None:
+    folder = name + ("(%s)" % order if order else "")
+    d = os.path.join(DATA_DIR, folder)
+    if mode:
+        d = os.path.join(d, mode)
+    os.makedirs(d, exist_ok=True)
+    # 演示导出使用「平均」而不是 avg，和真实数据习惯一致
+    with open(os.path.join(d, "%s.json" % condition), "w", encoding="utf-8") as fh:
+        json.dump(experiments, fh, ensure_ascii=False)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="生成车辆操稳试验数据")
+    p = argparse.ArgumentParser(description="生成车辆操稳试验演示数据")
     p.add_argument("--preset", choices=["tiny", "demo", "standard", "full"],
                    default="demo", help="规模预设（默认 demo）")
     p.add_argument("--vehicles", type=int, default=0, help="车辆数（覆盖 preset）")
@@ -964,20 +867,9 @@ def main() -> None:
     if args.runs <= 0:
         args.runs = 2
 
-    n_exp = args.vehicles * args.conditions * (args.runs + 1)
-    # 单次实验 ≈ 点数 × 21 数组 × 2(x,y) × 7 字节
-    gb_per_pt = 21 * 2 * 7 / 1024 ** 3
-    est = n_exp * gb_per_pt * (args.points * (args.conditions - 1) / args.conditions
-                               + args.steady_points / args.conditions)
     print("配置: %d 车 × %d 工况 × %d 次实验(+平均) | 普通 %d 点 / %s %d 点 | JSON=%s"
           % (args.vehicles, args.conditions, args.runs, args.points,
              STEADY_CONDITION, args.steady_points, args.json))
-    print("预计: %d 条实验 / %d 条曲线，库+JSON 合计约 %.2f GB"
-          % (n_exp, n_exp * 14, est * 2))
-    if est > 3:
-        print("      ⚠ 大批量生成较慢（demo 预设实测约 18 分钟），建议后台跑：")
-        print("        nohup python scripts/seed_data.py --preset %s > seed.log 2>&1 &"
-              % args.preset)
     seed(args)
 
 

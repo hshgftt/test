@@ -1,34 +1,81 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref } from 'vue'
+import { computed, nextTick, onMounted, reactive, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { getAllIndicatorsFlat, getConditions, getLastTiming, getTree, type Timing } from '@/api'
-import type { Condition, IndicatorFlat, IndicatorPage } from '@/types'
+import {
+  getAllIndicatorsFlat,
+  getLastTiming,
+  getMeta,
+  getVehicles,
+  type Timing,
+} from '@/api'
+import type {
+  AttrDef,
+  Condition,
+  DatasetType,
+  IndicatorFlat,
+  Meta,
+  StatsPage,
+  StatsRow,
+} from '@/types'
 
+/**
+ * 指标统计。
+ *
+ * ── 为什么筛选条件是「动态」的 ──
+ *
+ * 车辆字段会持续增加，所以这里不写死「平台 / 品牌」两个下拉，而是从
+ * `meta.attrs` 里挑可选值有限的字段（维度字段 + 带 options 的字段）自动生成。
+ * 新增一个「能源形式」筛选，后端加一行 attr_defs，这里不用改代码。
+ *
+ * 过滤条件以 `f_<code>` 交给服务端（`/api/indicators/all`），这样分页
+ * `total` 才是准的；前端只负责把当前页画出来。
+ */
+const meta = ref<Meta | null>(null)
 const conditions = ref<Condition[]>([])
+const datasetTypes = ref<DatasetType[]>([])
 const conditionId = ref<number | null>(null)
 const conditionName = ref<string>('')
-
-const platforms = ref<string[]>([])
-const platform = ref<string>('')
+const datasetType = ref<string>('')
 
 const loading = ref(false)
 
-/**
- * 200 车 × 20 工况会产生上万行，页面 2 走 flat + 分页，
- * 不再一次性把嵌套结构全拉下来。
- */
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(100)
 
-/**
- * 实验口径：只有两种。
- *
- * 每台车每个工况的实验次数**不固定**（可能 1 次、3 次、或者根本没有平均），
- * 所以这里不做「第一次 / 第二次」这种逐次勾选——那种 UI 在次数不定的数据上
- * 本来就不成立。筛选在**服务端**做，这样分页 total 才是准的。
- */
+/** 只分两种口径：次数不固定，不做逐次勾选 */
 const expScope = ref<'平均' | 'all'>('all')
+
+/** code → 选中的值 */
+const filters = reactive<Record<string, string>>({})
+
+/** 能作为筛选器的字段：维度字段或有固定候选值 */
+const filterAttrs = computed<AttrDef[]>(() =>
+  (meta.value?.attrs ?? []).filter(
+    (a) => a.value_type === 'dim' || (a.options?.length ?? 0) > 0,
+  ),
+)
+
+/** 表格里展示的车辆属性列（show_in_list） */
+const listAttrs = computed<AttrDef[]>(() =>
+  (meta.value?.attrs ?? []).filter((a) => a.show_in_list),
+)
+
+/**
+ * 维度字段的候选值取「车辆实际用到的值」，而不是字典全量。
+ *
+ * 维度字典里同一 dim_code 下可能同时有品牌与子品牌（父节点关系在导入时
+ * 是平铺的），全量列出来会让「品牌」下拉里混进子品牌名，选了必然查不到。
+ * 用真实数据收敛是唯一不会错的口径。
+ */
+const attrValues = ref<Record<string, string[]>>({})
+
+function optionsFor(attr: AttrDef): string[] {
+  if (attr.value_type === 'dim') {
+    return attrValues.value[attr.code] ?? []
+  }
+  return (attr.options ?? []).map((o) => String(o))
+}
 
 interface IndCol {
   rawKey: string
@@ -37,9 +84,8 @@ interface IndCol {
 }
 
 interface Row {
-  platform: string
-  brand: string
   vehicle: string
+  mode: string | null
   experiment: string
   isAverage: boolean
   [k: string]: unknown
@@ -47,46 +93,34 @@ interface Row {
 
 const allRows = ref<Row[]>([])
 const indCols = ref<IndCol[]>([])
-
-/** 本次结果里是否真的出现了「平均」实验 */
 const hasAverage = ref(false)
 
-async function loadConditions() {
-  conditions.value = await getConditions()
-  if (conditions.value.length) {
-    const step = conditions.value.find((c) => c.name === '角阶跃') ?? conditions.value[0]
-    conditionId.value = step.id
-    conditionName.value = step.name
-  }
-  const tree = await getTree()
-  platforms.value = Object.keys(tree)
-}
-
-function flatten(resp: IndicatorPage) {
+function flatten(resp: StatsPage) {
   const outRows: Row[] = []
   const map = new Map<string, IndCol>()
   let sawAverage = false
 
-  for (const r of resp.rows) {
-    const isAvg = r.is_average ?? r.experiment_no === '平均'
+  for (const r of resp.rows as StatsRow[]) {
+    const isAvg = r.is_average ?? r.exp_no === '平均'
     if (isAvg) sawAverage = true
     const row: Row = {
-      platform: r.platform,
-      brand: r.brand,
       vehicle: r.vehicle,
-      experiment: r.experiment_no,
+      mode: r.mode,
+      experiment: r.exp_no,
       isAverage: isAvg,
     }
-    for (const [rawKey, v] of Object.entries(
-      r.indicators as Record<string, IndicatorFlat>,
-    )) {
-      const val = v?.value
+    // 车辆属性是动态的：code → AttrValue
+    for (const [code, av] of Object.entries(r.attrs ?? {})) {
+      row[code] = av?.value ?? '-'
+    }
+    for (const [rawKey, v] of Object.entries(r.indicators ?? {})) {
+      const val = (v as IndicatorFlat)?.value
       row[rawKey] = val == null ? '-' : Number(Number(val).toFixed(4))
       if (!map.has(rawKey)) {
         map.set(rawKey, {
           rawKey,
-          name: v?.name ?? rawKey,
-          unit: v?.unit ?? null,
+          name: (v as IndicatorFlat)?.name ?? rawKey,
+          unit: (v as IndicatorFlat)?.unit ?? null,
         })
       }
     }
@@ -96,8 +130,7 @@ function flatten(resp: IndicatorPage) {
   allRows.value = outRows
   total.value = resp.total
   hasAverage.value = sawAverage
-  // 按指标名排字典序。不要用 raw_key 的数字前缀：
-  // 数字可能省略，且同一指标在不同工况下编号不同（车速：角阶跃10 / 角脉冲100）。
+  // 按指标名排字典序（raw_key 的数字前缀不可靠，见 README/历史注释）
   indCols.value = [...map.values()].sort((a, b) => {
     const c = a.name.localeCompare(b.name, 'zh')
     return c !== 0 ? c : a.rawKey.localeCompare(b.rawKey, 'zh')
@@ -109,16 +142,17 @@ async function loadData() {
   const t0 = performance.now()
   try {
     const resp = await getAllIndicatorsFlat({
-      platform: platform.value || undefined,
-      condition: conditionName.value || undefined,
+      filters: { ...filters },
+      // 用 ID 不用名字（中文名进 URL query 会被某些代理解码成原始字节导致 400）
+      condition_id: conditionId.value ?? undefined,
       average: expScope.value === '平均',
+      dataset_type: datasetType.value || undefined,
       limit: pageSize.value,
       offset: (page.value - 1) * pageSize.value,
     })
     const net = getLastTiming()
     const tAfterFetch = performance.now()
     flatten(resp)
-    // 等表格真正渲染完（v-loading 撤下、行 DOM 生成）再统计
     await nextTick()
     logTiming('indicators', t0, tAfterFetch, net, resp.rows?.length ?? 0)
   } catch (e: any) {
@@ -130,12 +164,6 @@ async function loadData() {
   }
 }
 
-/**
- * 把耗时拆成四段打到控制台（不占界面）。
- *
- * 服务的 `serverMs` 读的是响应头 `X-Server-Time-Ms`（后端自报的 SQL + 序列化），
- * 其余三段是前端侧测的。拆开打才能判断慢在数据库还是渲染。
- */
 function logTiming(
   label: string,
   t0: number,
@@ -157,8 +185,12 @@ function logTiming(
   )
 }
 
-/** 服务端已按口径过滤，这里直接展示 */
 const rows = computed<Row[]>(() => allRows.value)
+
+function reload() {
+  page.value = 1
+  loadData()
+}
 
 function onPageChange(p: number) {
   page.value = p
@@ -175,18 +207,7 @@ function onConditionChange(id: number | null) {
   const c = conditions.value.find((x) => x.id === id)
   conditionId.value = id
   conditionName.value = c?.name ?? ''
-  page.value = 1
-  loadData()
-}
-
-function onPlatformChange() {
-  page.value = 1
-  loadData()
-}
-
-function onScopeChange() {
-  page.value = 1
-  loadData()
+  reload()
 }
 
 /** export current table to CSV */
@@ -195,13 +216,15 @@ function exportCsv() {
     ElMessage.warning('暂无数据')
     return
   }
-  const head = ['平台', '品牌', '车型', '实验', ...indCols.value.map((c) =>
-    c.unit ? `${c.name}(${c.unit})` : c.name,
-  )]
+  const head = [
+    ...listAttrs.value.map((a) => a.name),
+    '试验模式',
+    '实验',
+    ...indCols.value.map((c) => (c.unit ? `${c.name}(${c.unit})` : c.name)),
+  ]
   const body = rows.value.map((r) => [
-    r.platform,
-    r.brand,
-    r.vehicle,
+    ...listAttrs.value.map((a) => String(r[a.code] ?? '')),
+    r.mode ?? '',
     r.isAverage ? '平均' : `第${r.experiment}次`,
     ...indCols.value.map((c) => String(r[c.rawKey] ?? '')),
   ])
@@ -224,7 +247,37 @@ const summary = computed(
 )
 
 onMounted(async () => {
-  await loadConditions()
+  try {
+    const [m, vehicles] = await Promise.all([getMeta(), getVehicles()])
+    meta.value = m
+    conditions.value = m.conditions
+    datasetTypes.value = m.dataset_types
+
+    // 汇总每个字段在真实车辆上出现过的值（去重排序）
+    const values: Record<string, Set<string>> = {}
+    for (const v of vehicles) {
+      for (const [code, raw] of Object.entries(v.attrs ?? {})) {
+        if (raw === null || raw === undefined || raw === '') continue
+        const s = String(raw)
+        ;(values[code] ??= new Set<string>()).add(s)
+      }
+    }
+    attrValues.value = Object.fromEntries(
+      Object.entries(values).map(([k, set]) => [
+        k,
+        [...set].sort((a, b) => a.localeCompare(b, 'zh')),
+      ]),
+    )
+
+    if (conditions.value.length) {
+      const step = conditions.value.find((c) => c.name === '角阶跃') ?? conditions.value[0]
+      conditionId.value = step.id
+      conditionName.value = step.name
+    }
+    if (datasetTypes.value.length) datasetType.value = datasetTypes.value[0].code
+  } catch (e: any) {
+    ElMessage.error(e.message || '配置加载失败')
+  }
   await loadData()
 })
 </script>
@@ -238,7 +291,7 @@ onMounted(async () => {
           :model-value="conditionId"
           placeholder="选择工况"
           size="small"
-          style="width: 160px"
+          style="width: 150px"
           @change="onConditionChange"
         >
           <el-option v-for="c in conditions" :key="c.id" :label="c.name" :value="c.id">
@@ -247,36 +300,64 @@ onMounted(async () => {
           </el-option>
         </el-select>
 
-        <span class="ctrl-label">平台</span>
-        <el-select
-          v-model="platform"
-          placeholder="全部平台"
-          clearable
-          size="small"
-          style="width: 150px"
-          @change="onPlatformChange"
-        >
-          <el-option label="全部平台" value="" />
-          <el-option v-for="p in platforms" :key="p" :label="p" :value="p" />
-        </el-select>
+        <template v-if="datasetTypes.length > 1">
+          <span class="ctrl-label">数据格式</span>
+          <el-select
+            v-model="datasetType"
+            size="small"
+            style="width: 150px"
+            @change="reload"
+          >
+            <el-option
+              v-for="t in datasetTypes"
+              :key="t.code"
+              :label="t.name"
+              :value="t.code"
+            />
+          </el-select>
+        </template>
 
-        <!-- 实验：只有两种口径（次数不固定，不做逐次勾选） -->
+        <!-- 筛选条件由字段注册表生成：新增字段不需要改这里 -->
+        <template v-for="a in filterAttrs" :key="a.code">
+          <span class="ctrl-label">{{ a.name }}</span>
+          <el-select
+            v-model="filters[a.code]"
+            :placeholder="`全部${a.name}`"
+            clearable
+            filterable
+            size="small"
+            style="width: 130px"
+            @change="reload"
+          >
+            <el-option
+              v-for="v in optionsFor(a)"
+              :key="v"
+              :label="v"
+              :value="v"
+            />
+          </el-select>
+        </template>
+
         <span class="ctrl-label">实验</span>
-        <el-radio-group v-model="expScope" size="small" @change="onScopeChange">
+        <el-radio-group v-model="expScope" size="small" @change="reload">
           <el-radio-button value="平均">仅平均</el-radio-button>
           <el-radio-button value="all">全部</el-radio-button>
         </el-radio-group>
-        <span class="hint">
-          每台车每个工况的实验次数不固定
-          <template v-if="expScope === '平均' && !hasAverage">· 当前结果里没有「平均」实验</template>
-        </span>
 
-        <el-button type="primary" size="small" :loading="loading" @click="loadData">
+        <el-button type="primary" size="small" :loading="loading" @click="reload">
           查询
         </el-button>
-        <el-button size="small" @click="exportCsv" :disabled="!rows.length">
+        <el-button size="small" :disabled="!rows.length" @click="exportCsv">
           导出 CSV
         </el-button>
+      </div>
+      <div class="ctrl-row second">
+        <span class="hint">
+          每台车每个工况的实验次数不固定
+          <template v-if="expScope === '平均' && !hasAverage">
+            · 当前结果里没有「平均」实验
+          </template>
+        </span>
         <span class="summary">{{ summary }}</span>
       </div>
     </el-card>
@@ -288,18 +369,32 @@ onMounted(async () => {
         border
         stripe
         size="small"
-        height="calc(100vh - 220px)"
+        height="calc(100vh - 260px)"
       >
-        <el-table-column prop="platform" label="平台" width="110" fixed />
-        <el-table-column prop="brand" label="品牌" width="100" fixed />
-        <el-table-column prop="vehicle" label="车型" width="120" fixed />
-        <el-table-column prop="experiment" label="实验" width="72" fixed align="center">
+        <!-- 车辆属性列：数量与名称都由 attr_defs 决定 -->
+        <el-table-column
+          v-for="a in listAttrs"
+          :key="a.code"
+          :prop="a.code"
+          :label="a.name"
+          min-width="98"
+          fixed
+        >
+          <template #default="{ row }">{{ row[a.code] ?? '-' }}</template>
+        </el-table-column>
+
+        <el-table-column label="试验模式" width="96" fixed align="center">
+          <template #default="{ row }">{{ row.mode ?? '—' }}</template>
+        </el-table-column>
+
+        <el-table-column label="实验" width="76" fixed align="center">
           <template #default="{ row }">
             <el-tag size="small" :type="row.isAverage ? 'warning' : 'info'">
               {{ row.isAverage ? '平均' : `第${row.experiment}次` }}
             </el-tag>
           </template>
         </el-table-column>
+
         <el-table-column
           v-for="c in indCols"
           :key="c.rawKey"
@@ -345,11 +440,16 @@ onMounted(async () => {
   gap: 10px;
   flex-wrap: wrap;
 }
+.ctrl-row.second {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed #eee;
+}
 .ctrl-label { font-size: 12px; color: #888; flex-shrink: 0; }
 .hint { font-size: 11px; color: #aaa; }
 .opt-cat { float: right; color: #aaa; font-size: 11px; margin-left: 8px; }
 .summary { margin-left: auto; font-size: 12px; color: #888; }
-.table-card { height: calc(100% - 76px); }
+.table-card { height: calc(100% - 116px); }
 .pager {
   display: flex;
   justify-content: flex-end;

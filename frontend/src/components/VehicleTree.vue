@@ -1,79 +1,149 @@
 <script setup lang="ts">
+/**
+ * 通用导航树。
+ *
+ * ── 为什么是「通用」──
+ *
+ * 层级数量、顺序、来源全部来自后端 `tree_profiles.levels`，前端**不做任何**
+ * 「平台 → 品牌 → 车」的假设。要给树加一层「能源形式」，改配置即可：
+ *
+ *     { source: 'attr', key: 'energy_type' }
+ *
+ * 组件只认节点上的 `kind` 与 `children`，因此哪怕以后出现新的 kind，
+ * 只要后端按同样的形状返回，这里照常渲染。
+ *
+ * 叶子是 `kind='segment'`（车 × 试验模式），勾选结果直接就是对比/取数接口
+ * 需要的分析单元，不再经过「车 id 列表」这一层中间态。
+ */
 import { computed, onMounted, ref, watch } from 'vue'
-import { getTree } from '@/api'
-import type { TreeResponse } from '@/types'
+import { ElMessage } from 'element-plus'
+import { getMeta, getTree } from '@/api'
+import type { Meta, NavNode, NavTree, SegmentRef, TreeLevel } from '@/types'
 
-const emit = defineEmits<{ (e: 'change', ids: number[]): void }>()
+const props = defineProps<{
+  /** 初始选中的分析单元（按 vehicle_id:mode_id 匹配），用于树重建后恢复 */
+  selected?: SegmentRef[]
+}>()
 
-interface TreeNode {
-  key: string
-  label: string
-  type: 'platform' | 'brand' | 'vehicle'
-  id?: number // only present on vehicle nodes
-  children?: TreeNode[]
-}
+const emit = defineEmits<{ (e: 'change', segs: SegmentRef[]): void }>()
 
-const rawTree = ref<TreeResponse>({})
+const treeRef = ref<any>(null)
 const loading = ref(false)
 const filterText = ref('')
 
-const treeRef = ref<any>(null)
+const meta = ref<Meta | null>(null)
+const nav = ref<NavTree | null>(null)
+const profileCode = ref<string>('')
 
-/** build el-tree data from { platform: { brand: [{id,name}] } } */
-const treeData = computed<TreeNode[]>(() => {
-  const out: TreeNode[] = []
-  for (const [platform, brands] of Object.entries(rawTree.value)) {
-    const brandNodes: TreeNode[] = []
-    for (const [brand, vehicles] of Object.entries(brands)) {
-      brandNodes.push({
-        key: `b-${brand}`,
-        label: brand,
-        type: 'brand',
-        children: vehicles.map((v) => ({
-          key: `v-${v.id}`,
-          label: v.name,
-          type: 'vehicle',
-          id: v.id,
-        })),
-      })
-    }
-    out.push({
-      key: `p-${platform}`,
-      label: platform,
-      type: 'platform',
-      children: brandNodes,
-    })
+/** 每个节点的原始对象，勾选后取 segment 用（tree 的 data 就是 NavNode） */
+const nodes = computed<NavNode[]>(() => nav.value?.nodes ?? [])
+
+/** 层级配置：用来给每层生成标签文字（平台 / 品牌 / 车型 …） */
+const levels = computed<TreeLevel[]>(() => nav.value?.levels ?? [])
+
+function levelTitle(node: NavNode): string {
+  if (node.kind === 'segment') return '单元'
+  if (node.kind === 'test_mode') {
+    const lv = levels.value.find((l) => l.source === 'test_mode')
+    return lv?.label || '模式'
   }
+  if (node.kind === 'vehicle') return '车型'
+  const lv = levels.value[node.level]
+  if (lv?.label) return lv.label
+  if (node.code) {
+    const def = meta.value?.attrs.find((a) => a.code === node.code)
+    if (def) return def.name
+  }
+  return '字段'
+}
+
+const KIND_COLOR: Record<string, string> = {
+  attr: '#667eea',
+  vehicle: '#00c2a8',
+  test_mode: '#f59e0b',
+  segment: '#909399',
+}
+
+function tagColor(node: NavNode): string {
+  return KIND_COLOR[node.kind] ?? '#909399'
+}
+
+/** 叶子节点的展示文字：segment 直接写模式（未分模式也有值） */
+function nodeLabel(node: NavNode): string {
+  if (node.kind === 'segment') return node.mode || node.vehicle_name || node.label
+  return node.label
+}
+
+/** el-tree 的 node-key 用后端生成的 key，全局唯一且跨层级稳定 */
+const treeData = computed(() => nodes.value)
+
+function filterNode(value: string, data: NavNode): boolean {
+  if (!value) return true
+  const kw = value.toLowerCase()
+  if (nodeLabel(data).toLowerCase().includes(kw)) return true
+  // 车名 / 模式名在所有层级都参与匹配，方便「搜一台车直接看到它所有模式」
+  if ((data.vehicle_name || '').toLowerCase().includes(kw)) return true
+  if ((data.mode || '').toLowerCase().includes(kw)) return true
+  return false
+}
+
+watch(filterText, (v) => treeRef.value?.filter(v))
+
+// ── 勾选 ───────────────────────────────────────────────────────────────
+
+/** 全部 segment 叶子 key，用于「全选」 */
+const allLeafKeys = computed<string[]>(() => {
+  const out: string[] = []
+  const walk = (list: NavNode[]) => {
+    for (const n of list) {
+      if (n.kind === 'segment') out.push(n.key)
+      if (n.children?.length) walk(n.children)
+    }
+  }
+  walk(nodes.value)
   return out
 })
 
-/** flat list of every vehicle id (used by 全选) */
-const allVehicleKeys = computed(() => {
-  const keys: string[] = []
-  const walk = (nodes: TreeNode[]) => {
-    for (const n of nodes) {
-      if (n.type === 'vehicle') keys.push(n.key)
-      else if (n.children) walk(n.children)
-    }
+function leavesOf(node: NavNode): string[] {
+  const out: string[] = []
+  const walk = (n: NavNode) => {
+    if (n.kind === 'segment') out.push(n.key)
+    ;(n.children ?? []).forEach(walk)
   }
-  walk(treeData.value)
-  return keys
-})
-
-const checkedCount = ref(0)
-
-function emitChecked() {
-  const tree = treeRef.value
-  if (!tree) return
-  // leafOnly = true → only vehicle nodes
-  const nodes: TreeNode[] = tree.getCheckedNodes(true, false)
-  const ids = nodes.filter((n) => n.type === 'vehicle' && n.id != null).map((n) => n.id!)
-  checkedCount.value = ids.length
-  emit('change', ids)
+  walk(node)
+  return out
 }
 
+/** 收集当前勾选的 segment 叶子 → 去重后的分析单元 */
+function collectChecked(): SegmentRef[] {
+  const tree = treeRef.value
+  if (!tree) return []
+  const picked: NavNode[] = tree.getCheckedNodes(true, false)
+  const out: SegmentRef[] = []
+  const seen = new Set<string>()
+  for (const n of picked) {
+    if (n.kind !== 'segment' || !n.segment) continue
+    const k = `${n.segment.vehicle_id}:${n.segment.mode_id ?? ''}`
+    if (seen.has(k)) continue
+    seen.add(k)
+    out.push(n.segment)
+  }
+  return out
+}
+
+const checkedSegments = ref<SegmentRef[]>([])
+
+function emitChecked() {
+  checkedSegments.value = collectChecked()
+  emit('change', checkedSegments.value)
+}
+
+const checkedVehicleCount = computed(
+  () => new Set(checkedSegments.value.map((s) => s.vehicle_id)).size,
+)
+
 function selectAll() {
-  treeRef.value?.setCheckedKeys(allVehicleKeys.value, false)
+  treeRef.value?.setCheckedKeys(allLeafKeys.value, false)
   emitChecked()
 }
 
@@ -82,89 +152,158 @@ function clearAll() {
   emitChecked()
 }
 
-/** select every vehicle of one platform */
-function selectPlatform(platform: string) {
-  const node = treeData.value.find((p) => p.label === platform)
-  if (!node?.children) return
-  const keys: string[] = []
-  for (const b of node.children) {
-    for (const v of b.children ?? []) keys.push(v.key)
-  }
+/** 只选某个子树（父节点后面的「选本层」按钮） */
+function selectSubtree(node: NavNode) {
+  const keys = leavesOf(node)
+  if (!keys.length) return
   treeRef.value?.setCheckedKeys(keys, false)
   emitChecked()
 }
 
-function filterNode(value: string, data: TreeNode) {
-  if (!value) return true
-  return data.label.toLowerCase().includes(value.toLowerCase())
+/** 按 `selected` prop 恢复勾选（对比页刷新 / 切换树后使用） */
+function restoreSelection() {
+  const want = new Set(
+    (props.selected ?? []).map((s) => `${s.vehicle_id}:${s.mode_id ?? ''}`),
+  )
+  if (!want.size) {
+    treeRef.value?.setCheckedKeys([], false)
+    emitChecked()
+    return
+  }
+  const keys: string[] = []
+  const walk = (list: NavNode[]) => {
+    for (const n of list) {
+      if (
+        n.kind === 'segment' &&
+        n.segment &&
+        want.has(`${n.segment.vehicle_id}:${n.segment.mode_id ?? ''}`)
+      ) {
+        keys.push(n.key)
+      }
+      if (n.children?.length) walk(n.children)
+    }
+  }
+  walk(nodes.value)
+  treeRef.value?.setCheckedKeys(keys, false)
+  emitChecked()
 }
 
-watch(filterText, (val) => {
-  treeRef.value?.filter(val)
-})
+// ── 加载 ───────────────────────────────────────────────────────────────
 
-onMounted(async () => {
+async function load(profile?: string) {
   loading.value = true
   try {
-    rawTree.value = await getTree()
+    const [m, t] = await Promise.all([getMeta(), getTree(profile)])
+    meta.value = m
+    nav.value = t
+    applyingProfile = true
+    profileCode.value = t.profile?.code ?? ''
+    applyingProfile = false
+    // 树换了：上一棵树里的 key 不能留到新树里
+    checkedSegments.value = []
+    emit('change', [])
+    if (props.selected?.length) {
+      // 等 el-tree 渲染出节点后再 setCheckedKeys
+      requestAnimationFrame(() => restoreSelection())
+    }
+  } catch (e: any) {
+    ElMessage.error(e.message || '导航树加载失败')
   } finally {
     loading.value = false
   }
+}
+
+/** 正在把「接口返回的 profile」写回 v-model，此时不应再发一次请求 */
+let applyingProfile = false
+
+watch(profileCode, (code, old) => {
+  if (applyingProfile) return
+  if (code && code !== old) load(code)
 })
 
-defineExpose({ selectAll, clearAll })
+onMounted(() => load())
+
+defineExpose({ reload: load, selectAll, clearAll })
 </script>
 
 <template>
-  <div class="tree-panel" v-loading="loading">
+  <div class="tree-panel">
     <div class="tree-toolbar">
+      <el-select
+        v-if="(meta?.tree_profiles?.length ?? 0) > 1"
+        v-model="profileCode"
+        size="small"
+        class="profile-select"
+        placeholder="导航方式"
+      >
+        <el-option
+          v-for="p in meta?.tree_profiles ?? []"
+          :key="p.code"
+          :label="p.name"
+          :value="p.code"
+        />
+      </el-select>
+
       <el-input
         v-model="filterText"
-        placeholder="搜索平台 / 品牌 / 车型"
+        placeholder="搜索车型 / 品牌 / 模式"
         clearable
         size="small"
-      >
-        <template #prefix><el-icon><Search /></el-icon></template>
-      </el-input>
+      />
+
       <div class="btn-row">
         <el-button size="small" type="primary" @click="selectAll">全选</el-button>
         <el-button size="small" @click="clearAll">清空</el-button>
       </div>
+
       <div class="checked-info">
-        已选 <b>{{ checkedCount }}</b> 台车
+        已选 <b>{{ checkedSegments.length }}</b> 个分析单元 ·
+        <b>{{ checkedVehicleCount }}</b> 台车
+        <span v-if="nav?.profile" class="profile-name">{{ nav.profile.name }}</span>
       </div>
     </div>
 
-    <el-scrollbar class="tree-scroll">
+    <el-scrollbar v-loading="loading" class="tree-scroll">
       <el-tree
         ref="treeRef"
         :data="treeData"
         node-key="key"
         show-checkbox
         default-expand-all
+        :expand-on-click-node="false"
         :filter-node-method="filterNode"
         @check="emitChecked"
-        class="vehicle-tree"
+        class="nav-tree"
       >
-        <template #default="{ node, data }">
+        <template #default="{ data }">
           <span class="node-label">
-            <span v-if="data.type === 'platform'" class="tag platform">平台</span>
-            <span v-else-if="data.type === 'brand'" class="tag brand">品牌</span>
-            <span v-else class="tag vehicle">车型</span>
-            <span>{{ node.label }}</span>
+            <span
+              class="tag"
+              :style="{ background: tagColor(data) }"
+            >{{ levelTitle(data) }}</span>
+            <span :class="{ 'seg-label': data.kind === 'segment' }">
+              {{ nodeLabel(data) }}
+            </span>
+            <span v-if="data.kind !== 'segment'" class="count">{{ data.count }}</span>
             <el-button
-              v-if="data.type === 'platform'"
+              v-if="data.kind !== 'segment' && data.children?.length"
               link
               size="small"
               type="primary"
               class="pick-btn"
-              @click.stop="selectPlatform(data.label)"
+              @click.stop="selectSubtree(data)"
             >
-              选本平台
+              选本级
             </el-button>
           </span>
         </template>
       </el-tree>
+
+      <el-empty
+        v-if="!loading && !nodes.length"
+        description="还没有数据，先去「上传数据」导入"
+        :image-size="70"
+      />
     </el-scrollbar>
   </div>
 </template>
@@ -186,40 +325,54 @@ defineExpose({ selectAll, clearAll })
   flex-direction: column;
   gap: 8px;
 }
-.btn-row {
-  display: flex;
-  gap: 6px;
-}
+.profile-select { width: 100%; }
+.btn-row { display: flex; gap: 6px; }
 .checked-info {
   font-size: 12px;
   color: #666;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.profile-name {
+  margin-left: auto;
+  color: #aaa;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 55%;
 }
 .tree-scroll {
   flex: 1;
   min-height: 0;
   padding: 6px 4px;
 }
-.vehicle-tree :deep(.el-tree-node__content) {
-  height: 30px;
-}
+.nav-tree :deep(.el-tree-node__content) { height: 30px; }
 .node-label {
   display: inline-flex;
   align-items: center;
   gap: 5px;
   font-size: 13px;
+  min-width: 0;
 }
+.seg-label { color: #444; }
 .tag {
   font-size: 10px;
-  padding: 1px 5px;
+  line-height: 1.6;
+  padding: 0 5px;
   border-radius: 3px;
   color: #fff;
   flex-shrink: 0;
 }
-.tag.platform { background: #667eea; }
-.tag.brand { background: #f5576c; }
-.tag.vehicle { background: #00c2a8; }
+.count {
+  font-size: 11px;
+  color: #aaa;
+}
 .pick-btn {
   margin-left: 4px;
   font-size: 11px;
+  visibility: hidden;
 }
+.nav-tree :deep(.el-tree-node__content:hover) .pick-btn { visibility: visible; }
 </style>

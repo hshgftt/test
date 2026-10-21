@@ -1,75 +1,849 @@
-"""
-CRUD layer – all database queries.
+"""CRUD 层 — 全部查询都在这里，元数据驱动。
 
-Operations matching the required APIs:
+核心概念
+========
 
-1. ``get_tree``                  → platform → brand → vehicle (directory tree)
-2. ``get_vehicle_condition_data``→ params + curves_cal + curves_duiqi for one vehicle × condition
-3. ``get_compare``               → same payload for several vehicles (page 1 comparison)
-4. ``get_all_indicators``        → all indicators nested by hierarchy (page 2 table)
+* **车辆属性**：``attr_defs`` 定义字段，``vehicle_attr_values`` 存值。
+  读的时候一次性把每台车的属性摊平成 ``{code: {name, value, …}}``，
+  新增字段不需要改这里的代码。
 
-Scale notes (200 cars × 20 工况 × 10万点)
------------------------------------------
-* Curves are **never** down-sampled — the front-end wants full resolution.
-  Instead the payload can be narrowed by ``exp_nos`` / ``curve_names`` so a
-  request only carries what the page actually renders.
+* **分析单元 segment**：``(vehicle_id, mode_id)``。导航树的叶子就是
+  segment，对比 / 取数 / 统计都以它为单位。
 
-  ``curve_names`` is pushed **into SQL** (``selectinload(...).and_(...)``),
-  not applied in Python: a 10万点 curve is ~3 MB of JSONB, so filtering
-  after the fact still pays the I/O + deserialisation for every curve.
+* **导航树投影**：``tree_profiles.levels`` 只声明层级，树节点在运行时
+  按车辆实际数据生成，不落库。层级顺序、数量、来源都可以变。
 
-* ``exp_scope='avg_first'`` 只取「平均」那一次（没有平均则取第一次）。
-  前端默认视图（同图取线=平均 / 指标表=仅平均）只需要这一次实验，
-  全量拉下来有 2/3 是白拉。
-
-* ``meta_only=True`` 只返回曲线元信息（title/xlabel/ylabel/point_count），
-  不碰 ``Curve.series``。稳态回转 14 条曲线时实测 328 MB → 0.16 MB，
-  让「先看菜单再点菜」成为可能。
-
-* ``get_all_indicators`` supports ``flat=True`` + ``limit/offset``.  At full
-  scale the nested variant would be ~350k indicator values in one response,
-  so page 2 must page through it — and the paging is done **in SQL**
-  (``LIMIT/OFFSET`` over experiment-level rows), not by slicing a list that
-  already holds every row in memory.
-
-Python 3.8 compatible (``typing.Dict/List/Optional`` only).
+* **数据信封**：``datasets`` 一条数据一行，标量在 ``metric_values``，
+  曲线在 ``curves``（一条曲线一行，series 整块 JSONB）。曲线过滤和
+  ``meta_only`` 都下推到 SQL。
 """
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Set
+from datetime import date, datetime
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
-from sqlalchemy import and_, exists, false, func, select
-from sqlalchemy.orm import Session, load_only, selectinload
+from sqlalchemy import and_, exists, false, func, or_, select
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.models import (
-    Brand,
+    AttrDef,
     Condition,
     Curve,
-    Experiment,
-    Indicator,
-    Platform,
+    Dataset,
+    DatasetType,
+    DimEntry,
+    MetricValue,
+    TestOrder,
+    TreeProfile,
     Vehicle,
+    VehicleAttrValue,
+    VehicleMode,
 )
 
 
-# ── helpers ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+# 元数据
+# ═══════════════════════════════════════════════════════════════════════
 
-def _series_stats(
-    series: Sequence[Dict[str, Any]],
-) -> tuple:
-    """Summarise a curve's series.
+def _attr_defs(db: Session, active_only: bool = True) -> List[AttrDef]:
+    stmt = select(AttrDef).order_by(AttrDef.sort_order, AttrDef.id)
+    if active_only:
+        stmt = stmt.where(AttrDef.is_active.is_(True))
+    return list(db.execute(stmt).scalars().all())
 
-    Returns ``(series_names, series_map)`` where ``series_map`` maps each
-    series' ``curvename`` to its length and order::
 
-        (['原始数据', '滤波'], {'原始数据': {'index': 0, 'point_count': 3000}, …})
+def _attr_levels(attrs: Sequence[AttrDef]) -> Dict[str, int]:
+    """``attr.code`` → 它在所属 dim_code 里的层级（0 开始）。
 
-    The front-end uses this to offer whatever data kinds actually exist —
-    the set is *not* limited to 原始数据 / 滤波.
+    同一 dim_code 下的字段按 ``sort_order`` 定义层级：品牌(0) → 子品牌(1)。
+    这是一种配置约定，不需要额外的表字段。
     """
+    groups: Dict[str, List[str]] = {}
+    for a in attrs:
+        if a.value_type == "dim" and a.dim_code:
+            groups.setdefault(a.dim_code, []).append(a.code)
+    levels: Dict[str, int] = {}
+    for _dim, codes in groups.items():
+        for i, code in enumerate(codes):
+            levels[code] = i
+    return levels
+
+
+def get_meta(db: Session) -> Dict[str, Any]:
+    """所有前端需要的配置：字段、维度、树配置、数据格式、工况、模式建议。"""
+    attrs = _attr_defs(db)
+
+    dims: Dict[str, List[Dict[str, Any]]] = {}
+    for e in db.execute(
+        select(DimEntry).where(DimEntry.is_active.is_(True))
+        .order_by(DimEntry.dim_code, DimEntry.sort_order, DimEntry.name)
+    ).scalars():
+        dims.setdefault(e.dim_code, []).append({
+            "id": e.id, "dim_code": e.dim_code, "name": e.name,
+            "parent_id": e.parent_id, "path": e.path,
+            "sort_order": e.sort_order,
+        })
+
+    profiles = [
+        {
+            "code": p.code, "name": p.name, "levels": p.levels or [],
+            "is_default": p.is_default,
+        }
+        for p in db.execute(select(TreeProfile).order_by(TreeProfile.id)).scalars()
+    ]
+
+    types = [
+        {"code": t.code, "name": t.name, "description": t.description}
+        for t in db.execute(
+            select(DatasetType).where(DatasetType.is_active.is_(True))
+            .order_by(DatasetType.id)
+        ).scalars()
+    ]
+
+    modes = [
+        r[0] for r in db.execute(
+            select(VehicleMode.mode).distinct().order_by(VehicleMode.mode)
+        )
+    ]
+
+    return {
+        "attrs": [
+            {
+                "id": a.id, "code": a.code, "name": a.name,
+                "value_type": a.value_type, "dim_code": a.dim_code,
+                "unit": a.unit, "required": a.required,
+                "show_in_list": a.show_in_list, "options": a.options,
+                "sort_order": a.sort_order,
+            }
+            for a in attrs
+        ],
+        "dims": dims,
+        "tree_profiles": profiles,
+        "dataset_types": types,
+        "conditions": get_conditions(db),
+        "mode_suggestions": modes,
+    }
+
+
+def _profile_dict(p: TreeProfile) -> Dict[str, Any]:
+    return {
+        "code": p.code, "name": p.name, "levels": p.levels or [],
+        "is_default": p.is_default,
+    }
+
+
+def create_tree_profile(db: Session, data: Dict[str, Any]) -> Dict[str, Any]:
+    code = str(data.get("code") or "").strip()
+    if not code:
+        raise ValueError("profile code 不能为空")
+    if db.execute(
+        select(TreeProfile).where(TreeProfile.code == code)
+    ).scalars().first():
+        raise ValueError("profile code 已存在：%s" % code)
+    levels = data.get("levels") or []
+    if not isinstance(levels, list):
+        raise ValueError("levels 必须是数组")
+    profile = TreeProfile(
+        code=code,
+        name=str(data.get("name") or code),
+        levels=levels,
+        is_default=bool(data.get("is_default", False)),
+    )
+    if profile.is_default:
+        for p in db.execute(select(TreeProfile)).scalars():
+            p.is_default = False
+    db.add(profile)
+    db.commit()
+    db.refresh(profile)
+    return _profile_dict(profile)
+
+
+def update_tree_profile(
+    db: Session, code: str, data: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    profile = db.execute(
+        select(TreeProfile).where(TreeProfile.code == code)
+    ).scalars().first()
+    if profile is None:
+        return None
+    if "name" in data and data.get("name"):
+        profile.name = str(data["name"])
+    if "levels" in data:
+        levels = data.get("levels") or []
+        if not isinstance(levels, list):
+            raise ValueError("levels 必须是数组")
+        profile.levels = levels
+    if "is_default" in data:
+        profile.is_default = bool(data.get("is_default"))
+        if profile.is_default:
+            for p in db.execute(select(TreeProfile)).scalars():
+                if p.id != profile.id:
+                    p.is_default = False
+    db.commit()
+    db.refresh(profile)
+    return _profile_dict(profile)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 车辆属性读取
+# ═══════════════════════════════════════════════════════════════════════
+
+def _chain_ids(entry: DimEntry, dim_map: Dict[int, DimEntry]) -> List[int]:
+    """从根到该节点的 id 链（按 path + 自身 id 还原）。"""
+    ids: List[int] = []
+    parts = [p for p in (entry.path or "").split("/") if p]
+    for p in parts:
+        try:
+            i = int(p)
+        except ValueError:
+            continue
+        if i != entry.id and i in dim_map:
+            ids.append(i)
+    if not ids or ids[-1] != entry.id:
+        # path 没写全时沿 parent_id 兜底
+        cur: Optional[DimEntry] = entry
+        rev: List[int] = []
+        seen: Set[int] = set()
+        while cur is not None and cur.id not in seen:
+            seen.add(cur.id)
+            rev.append(cur.id)
+            cur = dim_map.get(cur.parent_id) if cur.parent_id else None
+        ids = list(reversed(rev))
+    return ids
+
+
+def load_vehicle_attrs(
+    db: Session,
+    vehicle_ids: Optional[Sequence[int]] = None,
+) -> Dict[int, Dict[str, Dict[str, Any]]]:
+    """一次性读出多台车的属性：``{vehicle_id: {code: value_dict}}``。
+
+    ``value_dict``::
+
+        {"code": "brand", "name": "品牌", "value": "星河", "value_id": 3,
+         "unit": null, "value_type": "dim", "sort_order": 10}
+    """
+    attrs = _attr_defs(db)
+    attr_by_id = {a.id: a for a in attrs}
+    levels = _attr_levels(attrs)
+
+    dim_map: Dict[int, DimEntry] = {
+        e.id: e for e in db.execute(select(DimEntry)).scalars().all()
+    }
+
+    stmt = select(VehicleAttrValue)
+    if vehicle_ids is not None:
+        ids = list(vehicle_ids)
+        if not ids:
+            return {}
+        stmt = stmt.where(VehicleAttrValue.vehicle_id.in_(ids))
+    rows = list(db.execute(stmt).scalars().all())
+
+    out: Dict[int, Dict[str, Dict[str, Any]]] = {}
+    for row in rows:
+        attr = attr_by_id.get(row.attr_id)
+        if attr is None:
+            continue
+        bucket = out.setdefault(row.vehicle_id, {})
+
+        value: Any = None
+        value_id: Optional[int] = None
+        sort_order = 0
+
+        if attr.value_type == "dim" and row.value_dim_id:
+            entry = dim_map.get(row.value_dim_id)
+            if entry is not None:
+                chain = _chain_ids(entry, dim_map)
+                lv = levels.get(attr.code, 0)
+                # 车辆只填了深一层的节点（如只写子品牌、没写品牌）时，
+                # chain 会比 lv 短；此时直接取该节点自身，别把值丢掉。
+                node = dim_map.get(chain[lv]) if lv < len(chain) else entry
+                if node is not None:
+                    value = node.name
+                    value_id = node.id
+                    sort_order = node.sort_order
+        elif attr.value_type in ("number", "bool"):
+            value = row.value_num
+        else:
+            value = row.value_text
+
+        if value is None or value == "":
+            continue
+        bucket[attr.code] = {
+            "code": attr.code, "name": attr.name, "value": value,
+            "value_id": value_id, "unit": attr.unit,
+            "value_type": attr.value_type, "sort_order": sort_order,
+        }
+    return out
+
+
+def _vehicle_modes(db: Session, vehicle_ids: Sequence[int]) -> Dict[int, List[VehicleMode]]:
+    out: Dict[int, List[VehicleMode]] = {}
+    if not vehicle_ids:
+        return out
+    for m in db.execute(
+        select(VehicleMode).where(VehicleMode.vehicle_id.in_(list(vehicle_ids)))
+        .order_by(VehicleMode.sort_order, VehicleMode.mode)
+    ).scalars():
+        out.setdefault(m.vehicle_id, []).append(m)
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 导航树投影
+# ═══════════════════════════════════════════════════════════════════════
+
+def _profile_of(db: Session, code: Optional[str]) -> Optional[TreeProfile]:
+    if code:
+        return db.execute(
+            select(TreeProfile).where(TreeProfile.code == code)
+        ).scalars().first()
+    return db.execute(
+        select(TreeProfile).where(TreeProfile.is_default.is_(True)).order_by(TreeProfile.id)
+    ).scalars().first() or db.execute(
+        select(TreeProfile).order_by(TreeProfile.id)
+    ).scalars().first()
+
+
+def _filter_vehicle_ids(
+    attrs_map: Dict[int, Dict[str, Dict[str, Any]]],
+    filters: Dict[str, str],
+) -> Set[int]:
+    ids = set(attrs_map.keys())
+    for code, want in (filters or {}).items():
+        if want is None or want == "":
+            continue
+        ids = {
+            vid for vid in ids
+            if str((attrs_map.get(vid, {}).get(code) or {}).get("value") or "") == str(want)
+        }
+    return ids
+
+
+def get_nav_tree(
+    db: Session,
+    profile_code: Optional[str] = None,
+    filters: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """按 tree_profile 投影出一棵任意层级的导航树。
+
+    返回::
+
+        {"profile": {…}, "levels": […], "nodes": [{"key","label","kind",…}]}
+
+    叶子节点 ``kind='segment'``，带 ``segment={vehicle_id, mode_id, …}``。
+    层级数量、顺序、来源全部由 ``tree_profiles.levels`` 决定，这里的代码
+    不含任何「平台 / 品牌 / 车」的假设。
+    """
+    profile = _profile_of(db, profile_code)
+    if profile is None:
+        return {"profile": None, "levels": [], "nodes": []}
+    levels: List[Dict[str, Any]] = list(profile.levels or [])
+
+    vehicles = list(db.execute(select(Vehicle).order_by(Vehicle.name)).scalars().all())
+    vids = [v.id for v in vehicles]
+    attrs_map = load_vehicle_attrs(db, vids)
+    modes_map = _vehicle_modes(db, vids)
+
+    allow = _filter_vehicle_ids(attrs_map, filters or {}) if filters else None
+
+    roots: List[Dict[str, Any]] = []
+    root_index: Dict[str, Dict[str, Any]] = {}
+    wants_modes = any(lv.get("source") == "test_mode" for lv in levels)
+    tm_level = next((lv for lv in levels if lv.get("source") == "test_mode"), {})
+    mode_missing = tm_level.get("missing", "label")
+
+    for v in vehicles:
+        if allow is not None and v.id not in allow:
+            continue
+        vattrs = attrs_map.get(v.id, {})
+        modes = modes_map.get(v.id, [])
+
+        mode_choices: List[Tuple[Optional[VehicleMode], Dict[str, Any]]] = []
+        if wants_modes:
+            if modes:
+                for m in modes:
+                    mode_choices.append((m, {"mode": m.mode, "mode_id": m.id}))
+            elif mode_missing == "skip":
+                continue
+            else:
+                mode_choices.append((
+                    None,
+                    {"mode": tm_level.get("empty_label", "未分模式"), "mode_id": None},
+                ))
+        else:
+            mode_choices.append((None, {"mode": None, "mode_id": None}))
+
+        for mode_obj, mode_part in mode_choices:
+            parent: Optional[Dict[str, Any]] = None
+            container: Dict[str, Dict[str, Any]] = root_index
+            parent_children: List[Dict[str, Any]] = roots
+            ok = True
+
+            for li, lv in enumerate(levels):
+                parts = _level_parts(lv, li, v, vattrs, mode_obj, mode_part)
+                if parts is None:
+                    ok = False
+                    break
+                label, sort_key, kind, extra = parts
+                key = "%d|%s|%s|%s" % (li, kind, extra.get("code") or "", label)
+                node = container.get(key)
+                if node is None:
+                    node = {
+                        "key": key, "label": label, "kind": kind,
+                        "level": li, "children": [], "count": 0,
+                        "sort_order": sort_key,
+                    }
+                    node.update(extra)
+                    container[key] = node
+                    parent_children.append(node)
+                parent = node
+                container = node.setdefault("_index", {})
+                parent_children = node["children"]
+
+            if not ok:
+                continue
+
+            seg = {
+                "vehicle_id": v.id, "vehicle_name": v.name,
+                "mode_id": mode_part.get("mode_id"),
+                "mode": mode_part.get("mode"),
+            }
+            seg_key = "seg|%d|%s" % (v.id, mode_part.get("mode_id"))
+            if levels:
+                if parent is None:
+                    continue
+                target_children = parent["children"]
+                target_index = parent.setdefault("_index", {})
+                level_no = len(levels)
+                label = mode_part.get("mode") or v.name
+            else:
+                # 没有配置任何层级：树就是 segment 平铺
+                target_children = roots
+                target_index = root_index
+                level_no = 0
+                label = ("%s · %s" % (v.name, mode_part["mode"])
+                         if mode_part.get("mode") else v.name)
+            if seg_key in target_index:
+                continue
+            seg_node = {
+                "key": seg_key,
+                "label": label,
+                "kind": "segment",
+                "level": level_no,
+                "children": [],
+                "count": 1,
+                "sort_order": 0,
+                "segment": seg,
+                "vehicle_id": v.id,
+                "vehicle_name": v.name,
+                "mode_id": mode_part.get("mode_id"),
+                "mode": mode_part.get("mode"),
+                "attrs": {code: val.get("value") for code, val in vattrs.items()},
+            }
+            target_children.append(seg_node)
+            target_index[seg_key] = seg_node
+
+    def finalize(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        for n in nodes:
+            n.pop("_index", None)
+            kids = n.get("children") or []
+            if kids:
+                n["children"] = finalize(kids)
+                n["count"] = sum(k.get("count") or 0 for k in n["children"])
+        return sorted(
+            nodes,
+            key=lambda n: (n.get("sort_order") or 0, n.get("label") or ""),
+        )
+
+    return {
+        "profile": {
+            "code": profile.code, "name": profile.name,
+            "levels": levels, "is_default": profile.is_default,
+        },
+        "levels": levels,
+        "nodes": finalize(roots),
+    }
+
+
+def _level_parts(
+    level: Dict[str, Any],
+    li: int,
+    vehicle: Vehicle,
+    vattrs: Dict[str, Dict[str, Any]],
+    mode_obj: Optional[VehicleMode],
+    mode_part: Dict[str, Any],
+) -> Optional[Tuple[str, Any, str, Dict[str, Any]]]:
+    source = level.get("source")
+    if source == "vehicle":
+        return (vehicle.name, 0, "vehicle", {"vehicle_id": vehicle.id, "vehicle_name": vehicle.name})
+    if source == "test_mode":
+        if mode_obj is None and level.get("missing", "label") == "skip":
+            return None
+        label = mode_part.get("mode") or level.get("empty_label", "未分模式")
+        return (label, 0, "test_mode", {"mode_id": mode_part.get("mode_id"), "mode": label})
+    if source == "attr":
+        code = level.get("key") or ""
+        item = vattrs.get(code)
+        if item is None or item.get("value") in (None, ""):
+            if level.get("missing", "skip") == "skip":
+                return None
+            label = level.get("empty_label") or "未填写"
+            return (label, 0, "attr", {"code": code})
+        return (
+            str(item["value"]), item.get("sort_order") or 0, "attr",
+            {"code": code, "value_id": item.get("value_id")},
+        )
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 维度字典写入
+# ═══════════════════════════════════════════════════════════════════════
+
+def resolve_dim_entry(
+    db: Session,
+    dim_code: str,
+    name: str,
+    parent_id: Optional[int] = None,
+    sort_order: int = 0,
+) -> DimEntry:
+    """按 (dim_code, parent_id, name) 找到或创建维度节点，并维护 path。"""
+    name = str(name).strip()
+    q = select(DimEntry).where(
+        DimEntry.dim_code == dim_code,
+        DimEntry.name == name,
+        DimEntry.parent_id.is_(None) if parent_id is None else DimEntry.parent_id == parent_id,
+    )
+    entry = db.execute(q).scalars().first()
+    if entry is not None:
+        return entry
+
+    parent = db.get(DimEntry, parent_id) if parent_id else None
+    entry = DimEntry(
+        dim_code=dim_code, name=name, parent_id=parent_id,
+        path=(parent.path if parent else "/"), sort_order=sort_order,
+    )
+    db.add(entry)
+    db.flush()
+    entry.path = ((parent.path if parent else "/") + "%d/" % entry.id)
+    db.flush()
+    return entry
+
+
+def _dim_parent_entry(
+    db: Session,
+    vehicle: Vehicle,
+    attr: AttrDef,
+    attrs: Sequence[AttrDef],
+    levels: Dict[str, int],
+) -> Optional[DimEntry]:
+    """找到本字段上一级（同 dim_code、level-1）的维度节点。"""
+    lv = levels.get(attr.code, 0)
+    if lv <= 0:
+        return None
+    siblings = [
+        a for a in attrs
+        if a.value_type == "dim" and a.dim_code == attr.dim_code
+    ]
+    if lv - 1 >= len(siblings):
+        return None
+    parent_attr = siblings[lv - 1]
+    row = db.execute(
+        select(VehicleAttrValue).where(
+            VehicleAttrValue.vehicle_id == vehicle.id,
+            VehicleAttrValue.attr_id == parent_attr.id,
+        )
+    ).scalars().first()
+    if row is None or not row.value_dim_id:
+        return None
+    return db.get(DimEntry, row.value_dim_id)
+
+
+def _parse_number(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def set_vehicle_attrs(
+    db: Session,
+    vehicle: Vehicle,
+    values: Dict[str, Any],
+) -> None:
+    """按 ``{code: value}`` 写入车辆属性。
+
+    * ``dim`` 字段：value 是维度名称，必要时自动创建节点（含父子链）。
+    * ``number / bool``：写 ``value_num``。
+    * 其它：写 ``value_text``。
+    传空值（None / ""）表示删除该字段。
+    """
+    attrs = _attr_defs(db)
+    attr_by_code = {a.code: a for a in attrs}
+    level_map = _attr_levels(attrs)
+
+    existing = {
+        r.attr_id: r for r in db.execute(
+            select(VehicleAttrValue).where(VehicleAttrValue.vehicle_id == vehicle.id)
+        ).scalars()
+    }
+
+    # 按 sort_order 处理，保证父级维度先落库
+    for attr in attrs:
+        if attr.code not in values:
+            continue
+        raw = values[attr.code]
+        row = existing.get(attr.id)
+
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            if row is not None:
+                db.delete(row)
+            continue
+
+        if attr.value_type == "dim":
+            parent = _dim_parent_entry(db, vehicle, attr, attrs, level_map)
+            entry = resolve_dim_entry(
+                db, attr.dim_code or "", str(raw), parent.id if parent else None,
+                sort_order=attr.sort_order,
+            )
+            if row is None:
+                row = VehicleAttrValue(vehicle_id=vehicle.id, attr_id=attr.id)
+                db.add(row)
+                existing[attr.id] = row
+            row.value_dim_id = entry.id
+            row.value_text = entry.name
+            row.value_num = None
+        elif attr.value_type == "number":
+            num = _parse_number(raw)
+            if row is None:
+                row = VehicleAttrValue(vehicle_id=vehicle.id, attr_id=attr.id)
+                db.add(row)
+                existing[attr.id] = row
+            row.value_num = num
+            row.value_text = None if num is None else str(raw)
+            row.value_dim_id = None
+        elif attr.value_type == "bool":
+            num = 1.0 if str(raw).strip().lower() in ("1", "true", "yes", "是", "y") else 0.0
+            if row is None:
+                row = VehicleAttrValue(vehicle_id=vehicle.id, attr_id=attr.id)
+                db.add(row)
+                existing[attr.id] = row
+            row.value_num = num
+            row.value_text = str(raw)
+            row.value_dim_id = None
+        else:
+            if isinstance(raw, (date, datetime)):
+                raw = raw.isoformat()
+            if row is None:
+                row = VehicleAttrValue(vehicle_id=vehicle.id, attr_id=attr.id)
+                db.add(row)
+                existing[attr.id] = row
+            row.value_text = str(raw)
+            row.value_num = None
+            row.value_dim_id = None
+
+    db.flush()
+
+
+def sync_vehicle_modes(db: Session, vehicle: Vehicle, modes: Iterable[str]) -> None:
+    """把车辆模式同步成给定列表（新增 / 删除）。"""
+    wanted: List[str] = []
+    for m in modes or []:
+        name = str(m).strip()
+        if name and name not in wanted:
+            wanted.append(name)
+
+    existing = {
+        m.mode: m for m in db.execute(
+            select(VehicleMode).where(VehicleMode.vehicle_id == vehicle.id)
+        ).scalars()
+    }
+    for name in wanted:
+        if name not in existing:
+            db.add(VehicleMode(
+                vehicle_id=vehicle.id, mode=name, sort_order=len(existing),
+            ))
+            existing[name] = None
+    for name, obj in list(existing.items()):
+        if obj is not None and name not in wanted:
+            db.delete(obj)
+    db.flush()
+
+
+def sync_test_orders(db: Session, vehicle: Vehicle, orders: Iterable[Any]) -> None:
+    """同步试验单号。``orders`` 支持 ``["CS-001"]`` 或 ``[{discipline, order_no}]``。"""
+    wanted: List[Tuple[str, str]] = []
+    for o in orders or []:
+        if isinstance(o, dict):
+            discipline = str(o.get("discipline") or "操稳").strip()
+            no = str(o.get("order_no") or "").strip()
+        else:
+            discipline, no = "操稳", str(o).strip()
+        if no and (discipline, no) not in wanted:
+            wanted.append((discipline, no))
+
+    existing = {
+        (o.discipline, o.order_no): o for o in db.execute(
+            select(TestOrder).where(TestOrder.vehicle_id == vehicle.id)
+        ).scalars()
+    }
+    for discipline, no in wanted:
+        if (discipline, no) not in existing:
+            db.add(TestOrder(
+                vehicle_id=vehicle.id, discipline=discipline, order_no=no,
+            ))
+            existing[(discipline, no)] = None
+    for key, obj in list(existing.items()):
+        if obj is not None and key not in wanted:
+            db.delete(obj)
+    db.flush()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 车辆详情 / 增删改
+# ═══════════════════════════════════════════════════════════════════════
+
+def get_vehicle_detail(db: Session, vehicle_id: int) -> Optional[Dict[str, Any]]:
+    vehicle = db.get(Vehicle, vehicle_id)
+    if vehicle is None:
+        return None
+    attrs = load_vehicle_attrs(db, [vehicle_id]).get(vehicle_id, {})
+    modes = db.execute(
+        select(VehicleMode).where(VehicleMode.vehicle_id == vehicle_id)
+        .order_by(VehicleMode.sort_order, VehicleMode.mode)
+    ).scalars().all()
+    orders = db.execute(
+        select(TestOrder).where(TestOrder.vehicle_id == vehicle_id)
+        .order_by(TestOrder.discipline, TestOrder.order_no)
+    ).scalars().all()
+    n_datasets = int(db.execute(
+        select(func.count(Dataset.id)).where(Dataset.vehicle_id == vehicle_id)
+    ).scalar() or 0)
+    return {
+        "id": vehicle.id, "name": vehicle.name,
+        "attrs": attrs,
+        "modes": [{"id": m.id, "mode": m.mode, "sort_order": m.sort_order} for m in modes],
+        "test_orders": [
+            {"id": o.id, "discipline": o.discipline, "order_no": o.order_no}
+            for o in orders
+        ],
+        "dataset_count": n_datasets,
+    }
+
+
+def create_vehicle(db: Session, data: Dict[str, Any]) -> Dict[str, Any]:
+    name = str(data.get("name") or "").strip()
+    if not name:
+        raise ValueError("车名不能为空")
+    if db.execute(select(Vehicle).where(Vehicle.name == name)).scalars().first():
+        raise ValueError("车名已存在：%s" % name)
+
+    vehicle = Vehicle(name=name)
+    db.add(vehicle)
+    db.flush()
+    set_vehicle_attrs(db, vehicle, data.get("attrs") or {})
+    sync_vehicle_modes(db, vehicle, data.get("modes") or [])
+    sync_test_orders(db, vehicle, data.get("test_orders") or [])
+    db.commit()
+    return get_vehicle_detail(db, vehicle.id) or {}
+
+
+def update_vehicle(db: Session, vehicle_id: int, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    vehicle = db.get(Vehicle, vehicle_id)
+    if vehicle is None:
+        return None
+
+    if "name" in data:
+        name = str(data.get("name") or "").strip()
+        if not name:
+            raise ValueError("车名不能为空")
+        other = db.execute(
+            select(Vehicle).where(Vehicle.name == name, Vehicle.id != vehicle_id)
+        ).scalars().first()
+        if other:
+            raise ValueError("车名已存在：%s" % name)
+        vehicle.name = name
+
+    if "attrs" in data:
+        set_vehicle_attrs(db, vehicle, data.get("attrs") or {})
+    if "modes" in data:
+        sync_vehicle_modes(db, vehicle, data.get("modes") or [])
+    if "test_orders" in data:
+        sync_test_orders(db, vehicle, data.get("test_orders") or [])
+
+    db.commit()
+    return get_vehicle_detail(db, vehicle_id)
+
+
+def delete_vehicle(db: Session, vehicle_id: int) -> bool:
+    vehicle = db.get(Vehicle, vehicle_id)
+    if vehicle is None:
+        return False
+    db.delete(vehicle)
+    db.commit()
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 工况
+# ═══════════════════════════════════════════════════════════════════════
+
+def get_conditions(
+    db: Session,
+    vehicle_id: Optional[int] = None,
+    mode_id: Optional[int] = None,
+    dataset_type: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    stmt = select(Condition).order_by(Condition.name)
+    if vehicle_id is not None or mode_id is not None or dataset_type:
+        sub = select(Dataset.condition_id)
+        if vehicle_id is not None:
+            sub = sub.where(Dataset.vehicle_id == vehicle_id)
+        if mode_id is not None:
+            sub = sub.where(Dataset.mode_id == mode_id)
+        if dataset_type:
+            sub = sub.join(DatasetType, DatasetType.id == Dataset.dataset_type_id).where(
+                DatasetType.code == dataset_type
+            )
+        stmt = stmt.where(Condition.id.in_(sub.distinct()))
+    return [
+        {
+            "id": c.id, "name": c.name,
+            "description": c.description, "category": c.category,
+        }
+        for c in db.execute(stmt).scalars()
+    ]
+
+
+def get_curve_names(
+    db: Session,
+    condition_id: int,
+    dataset_type: Optional[str] = None,
+) -> List[str]:
+    stmt = (
+        select(Curve.name).distinct()
+        .join(Dataset, Dataset.id == Curve.dataset_id)
+        .where(Dataset.condition_id == condition_id)
+        .order_by(Curve.name)
+    )
+    if dataset_type:
+        stmt = stmt.join(DatasetType, DatasetType.id == Dataset.dataset_type_id).where(
+            DatasetType.code == dataset_type
+        )
+    return [r[0] for r in db.execute(stmt)]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 数据集读取（单 segment / 多 segment）
+# ═══════════════════════════════════════════════════════════════════════
+
+def _series_stats(series: Sequence[Dict[str, Any]]) -> Tuple[List[str], Dict[str, Any]]:
     names: List[str] = []
-    smap: Dict[str, Dict[str, Any]] = {}
+    smap: Dict[str, Any] = {}
     for idx, s in enumerate(series or []):
         nm = (s or {}).get("curvename") or "series%d" % idx
         if nm in smap:
@@ -82,16 +856,20 @@ def _series_stats(
     return names, smap
 
 
+_CURVE_META_COLS = (
+    Curve.id,
+    Curve.dataset_id,
+    Curve.group,
+    Curve.name,
+    Curve.title,
+    Curve.xlabel,
+    Curve.ylabel,
+    Curve.point_count,
+    Curve.sort_order,
+)
+
+
 def _curve_payload(cur: Any, meta_only: bool = False) -> Dict[str, Any]:
-    """把一条曲线组装成前端要的 payload。
-
-    ``cur`` 只要**有这几个属性**就行 —— ORM 的 ``Curve`` 和 Core 查询返回的
-    ``Row`` 都能直接传（流式端点走 Core 查询，避免 ORM identity map 把
-    上千条曲线对象一直攥在内存里，见 ``iter_compare_stream``）。
-
-    ``meta_only=True`` 时刻意不读 ``cur.series`` —— 那是 JSONB 重列，
-    读它等于把整个点集拉进 Python。
-    """
     payload: Dict[str, Any] = {
         "name": cur.name,
         "title": cur.title,
@@ -101,6 +879,7 @@ def _curve_payload(cur: Any, meta_only: bool = False) -> Dict[str, Any]:
     }
     if meta_only:
         payload["series"] = []
+        payload["series_names"] = []
         return payload
     series = cur.series or []
     n = cur.point_count
@@ -114,133 +893,39 @@ def _curve_payload(cur: Any, meta_only: bool = False) -> Dict[str, Any]:
     return payload
 
 
-def _exp_payload(
-    exp: Experiment,
+def _dataset_payload(
+    ds: Dataset,
     curve_names: Optional[Set[str]] = None,
     meta_only: bool = False,
 ) -> Dict[str, Any]:
-    """Assemble one experiment into {params, curves_cal, curves_duiqi}.
-
-    ``curve_names`` optionally narrows the curves returned (the caller only
-    renders some of them).  Series data itself is always full resolution.
-
-    ``meta_only=True`` returns curve *metadata only* — no ``series`` payload
-    and no ``series_names``/``series_map``.  In that mode the caller must
-    have loaded the curves with ``load_only`` (see ``_load_experiments``);
-    touching ``cur.series`` here would trigger a lazy SELECT per curve.
-
-    Each full curve carries ``series_names`` (actual data kinds found in it)
-    so the front-end never has to hard-code '原始数据' / '滤波'.
-    """
-    # ── params: indicators ordered by name (seq 已废弃，见 models.Indicator) ──
     params: Dict[str, Dict[str, Any]] = {}
-    for ind in sorted(exp.indicators, key=lambda i: (i.name, i.raw_key)):
-        params[ind.raw_key] = {
-            "name": ind.name,
-            "unit": ind.unit,
-            "raw_key": ind.raw_key,
-            "value": ind.value,
-            "text_value": ind.text_value,
+    for m in sorted(ds.metrics, key=lambda x: (x.name, x.raw_key)):
+        params[m.raw_key] = {
+            "name": m.name, "unit": m.unit, "raw_key": m.raw_key,
+            "value": m.value, "text_value": m.text_value,
         }
 
-    # ── curves: split by group, keep definition order ──
-    cal: Dict[str, Dict[str, Any]] = {}
-    dui: Dict[str, Dict[str, Any]] = {}
-    for cur in sorted(exp.curves, key=lambda c: c.sort_order):
+    groups: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    for cur in sorted(ds.curves, key=lambda c: c.sort_order):
         if curve_names is not None and cur.name not in curve_names:
             continue
-        payload = _curve_payload(cur, meta_only)
-        (cal if cur.group == "cal" else dui)[cur.name] = payload
+        groups.setdefault(cur.group, {})[cur.name] = _curve_payload(cur, meta_only)
 
     return {
-        "experiment_id": exp.id,
-        "experiment_no": exp.experiment_no,
-        "is_average": exp.is_average,
+        "dataset_id": ds.id,
+        "exp_no": ds.exp_no,
+        "is_average": bool(ds.is_average),
+        "name": ds.name,
+        "dataset_type": ds.dataset_type.code if ds.dataset_type else None,
+        "payload": ds.payload,
         "params": params,
-        "curves_cal": cal,
-        "curves_duiqi": dui,
+        # 不再写死 cal / duiqi：group 是数据驱动的，新格式可以自带新分组
+        "curves": groups,
     }
 
 
-def _collect_curve_meta(
-    vehicles: Sequence[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Aggregate curve metadata across the whole compare response.
-
-    Output::
-
-        {
-          "groups": {
-            "cal":   {"series_names": ["原始数据", "滤波"],
-                      "curves": {"方向盘转角-时间": {"series_names": […], "title": …}}},
-            "duiqi": {…}
-          }
-        }
-
-    The front-end drives its curve panel off this — no hard-coded names,
-    works whatever groups / data kinds the payload turns out to contain.
-
-    ⚠️ 它描述的是**本次响应里实际带到的曲线**，所以给了 ``curves=`` 时会跟着收敛。
-    想让前端看到「菜单上有什么」，就用 ``meta_only=True`` 单独请求一次
-    （那时没有 ``curves=`` 过滤，返回全部曲线的元信息）。
-    """
-    groups: Dict[str, Any] = {}
-    for group in ("cal", "duiqi"):
-        key = "curves_cal" if group == "cal" else "curves_duiqi"
-        series_seen: List[str] = []
-        curves: Dict[str, Any] = {}
-        for veh in vehicles:
-            for exp in veh.get("experiments") or []:
-                for cname, cval in (exp.get(key) or {}).items():
-                    entry = curves.get(cname)
-                    if entry is None:
-                        entry = {
-                            "name": cname,
-                            "title": cval.get("title") or cname,
-                            "xlabel": cval.get("xlabel"),
-                            "ylabel": cval.get("ylabel"),
-                            "point_count": cval.get("point_count") or 0,
-                            "series_names": [],
-                        }
-                        curves[cname] = entry
-                    for nm in cval.get("series_names") or []:
-                        if nm not in entry["series_names"]:
-                            entry["series_names"].append(nm)
-                        if nm not in series_seen:
-                            series_seen.append(nm)
-        groups[group] = {"series_names": series_seen, "curves": curves}
-    return {"groups": groups}
-
-
-# 曲线元信息只需要这些列；series 是重列（JSONB），meta_only 时刻意不取
-_CURVE_META_COLS = (
-    Curve.id,
-    Curve.experiment_id,
-    Curve.group,
-    Curve.name,
-    Curve.title,
-    Curve.xlabel,
-    Curve.ylabel,
-    Curve.point_count,
-    Curve.sort_order,
-)
-
-
-def _curve_option(
-    curve_names: Optional[Set[str]] = None,
-    meta_only: bool = False,
-):
-    """``selectinload(Experiment.curves)``，可选「按名过滤」+「只取元信息」。
-
-    为什么要把 ``curve_names`` 下推到 SQL：以前它只在 ``_exp_payload`` 里
-    过滤，而那时 ``selectinload`` 已经把**每条**曲线的 JSONB 读出来并反序列化
-    成 Python dict 了。稳态回转 14 条曲线、10 万点/条 ≈ 328 MB，只画 1 条也要
-    付这 328 MB。下推之后只读选中的那条。
-
-    ``meta_only`` 再加一层 ``load_only`` —— 连选中的曲线也不读 series，
-    只读标量列，用于「先拿元信息、再按需取数据」的两阶段加载。
-    """
-    rel = Experiment.curves
+def _curve_option(curve_names: Optional[Set[str]] = None, meta_only: bool = False):
+    rel = Dataset.curves
     if curve_names:
         rel = rel.and_(Curve.name.in_(list(curve_names)))
     opt = selectinload(rel)
@@ -250,350 +935,292 @@ def _curve_option(
 
 
 def _apply_exp_scope(stmt, exp_scope: Optional[str]):
-    """按口径收敛实验。
-
-    * ``None`` / ``'all'`` —— 全部实验（默认，保持老行为）
-    * ``'avg_first'``     —— 每台车取「平均」，没有平均就取第一次
-
-    ``avg_first`` 与前端 ``expsFor()`` 的取线规则一致（平均优先，否则第一次），
-    只是把它从「前端过滤」提前到「SQL 只读需要的行」。用窗口函数表达：
-
-        ROW_NUMBER() OVER (PARTITION BY vehicle_id
-                           ORDER BY is_average DESC, sort_order ASC) = 1
-
-    ``sort_order`` 把「平均」放在 999，所以这个排序天然实现
-    「有平均取平均、没有就取 sort_order 最小的那次」。
-
-    注意 ``is_average`` 历史数据可能是 NULL，PG 的 ``DESC`` 默认 NULLS FIRST
-    会让 NULL 排到最前 —— 所以用 ``coalesce`` 兜底成 false。
-    """
     if exp_scope != "avg_first":
         return stmt
-
     rn = func.row_number().over(
-        partition_by=Experiment.vehicle_id,
+        partition_by=[Dataset.vehicle_id, Dataset.mode_id],
         order_by=[
-            func.coalesce(Experiment.is_average, false()).desc(),
-            Experiment.sort_order.asc(),
+            func.coalesce(Dataset.is_average, false()).desc(),
+            Dataset.sort_order.asc(),
         ],
     ).label("rn")
-
-    inner = stmt.with_only_columns(Experiment.id.label("id"), rn).subquery()
+    inner = stmt.with_only_columns(Dataset.id.label("id"), rn).subquery()
     return (
-        select(Experiment)
-        .join(inner, inner.c.id == Experiment.id)
+        select(Dataset)
+        .join(inner, inner.c.id == Dataset.id)
         .where(inner.c.rn == 1)
     )
 
 
-def _load_experiments(
+def _segment_clause(segments: Sequence[Tuple[int, Optional[int]]]):
+    clauses = []
+    for vid, mid in segments:
+        if mid is None:
+            clauses.append(and_(
+                Dataset.vehicle_id == vid, Dataset.mode_id.is_(None),
+            ))
+        else:
+            clauses.append(and_(
+                Dataset.vehicle_id == vid, Dataset.mode_id == mid,
+            ))
+    return or_(*clauses) if clauses else false()
+
+
+def _load_datasets(
     db: Session,
-    vehicle_id: int,
+    segments: Sequence[Tuple[int, Optional[int]]],
     condition_id: int,
+    dataset_type: Optional[str] = None,
     exp_nos: Optional[Sequence[str]] = None,
     curve_names: Optional[Set[str]] = None,
     meta_only: bool = False,
     exp_scope: Optional[str] = None,
-) -> List[Experiment]:
-    """Experiments for a vehicle × condition, indicators+curves eager-loaded."""
-    stmt = select(Experiment).where(
-        Experiment.vehicle_id == vehicle_id,
-        Experiment.condition_id == condition_id,
+) -> Dict[Tuple[int, Optional[int]], List[Dataset]]:
+    stmt = select(Dataset).where(
+        Dataset.condition_id == condition_id,
+        _segment_clause(segments),
     )
+    if dataset_type:
+        stmt = stmt.join(
+            DatasetType, DatasetType.id == Dataset.dataset_type_id
+        ).where(DatasetType.code == dataset_type)
     if exp_nos:
-        stmt = stmt.where(Experiment.experiment_no.in_(list(exp_nos)))
+        stmt = stmt.where(Dataset.exp_no.in_(list(exp_nos)))
     stmt = _apply_exp_scope(stmt, exp_scope).options(
-        selectinload(Experiment.indicators),
+        selectinload(Dataset.metrics),
+        joinedload(Dataset.dataset_type),
         _curve_option(curve_names, meta_only),
-    ).order_by(Experiment.sort_order)
-    return list(db.execute(stmt).scalars().all())
+    ).order_by(Dataset.vehicle_id, Dataset.mode_id, Dataset.sort_order)
 
-
-def _load_experiments_bulk(
-    db: Session,
-    vehicle_ids: Sequence[int],
-    condition_id: int,
-    exp_nos: Optional[Sequence[str]] = None,
-    curve_names: Optional[Set[str]] = None,
-    meta_only: bool = False,
-    exp_scope: Optional[str] = None,
-) -> Dict[int, List[Experiment]]:
-    """One query for many vehicles (avoids N+1 on the compare endpoint)."""
-    stmt = select(Experiment).where(
-        Experiment.vehicle_id.in_(list(vehicle_ids)),
-        Experiment.condition_id == condition_id,
-    )
-    if exp_nos:
-        stmt = stmt.where(Experiment.experiment_no.in_(list(exp_nos)))
-    stmt = _apply_exp_scope(stmt, exp_scope).options(
-        selectinload(Experiment.indicators),
-        _curve_option(curve_names, meta_only),
-    ).order_by(Experiment.vehicle_id, Experiment.sort_order)
-
-    out: Dict[int, List[Experiment]] = {}
-    for exp in db.execute(stmt).scalars().all():
-        out.setdefault(exp.vehicle_id, []).append(exp)
+    out: Dict[Tuple[int, Optional[int]], List[Dataset]] = {}
+    for ds in db.execute(stmt).scalars().all():
+        out.setdefault((ds.vehicle_id, ds.mode_id), []).append(ds)
     return out
 
 
-# ── API 1: directory tree ───────────────────────────────────────────────
+def _collect_curve_meta(vehicles: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    groups: Dict[str, Any] = {}
+    for veh in vehicles:
+        for exp in veh.get("experiments") or []:
+            for group, cdict in (exp.get("curves") or {}).items():
+                g = groups.setdefault(group, {"series_names": [], "curves": {}})
+                for cname, cval in (cdict or {}).items():
+                    entry = g["curves"].get(cname)
+                    if entry is None:
+                        entry = {
+                            "name": cname,
+                            "title": cval.get("title") or cname,
+                            "xlabel": cval.get("xlabel"),
+                            "ylabel": cval.get("ylabel"),
+                            "point_count": cval.get("point_count") or 0,
+                            "series_names": [],
+                        }
+                        g["curves"][cname] = entry
+                    for nm in cval.get("series_names") or []:
+                        if nm not in entry["series_names"]:
+                            entry["series_names"].append(nm)
+                        if nm not in g["series_names"]:
+                            g["series_names"].append(nm)
+    return {"groups": groups}
 
-def get_tree(
-    db: Session, platform_name: Optional[str] = None
-) -> Dict[str, Dict[str, List[Dict[str, Any]]]]:
-    """Return ``{platform: {brand: [{id, name}, …]}}``."""
-    stmt = (
-        select(Platform.name, Brand.name, Vehicle.id, Vehicle.name)
-        .join(Brand, Brand.platform_id == Platform.id)
-        .join(Vehicle, Vehicle.brand_id == Brand.id)
-        .order_by(Platform.name, Brand.name, Vehicle.name)
-    )
-    if platform_name:
-        stmt = stmt.where(Platform.name == platform_name)
 
-    tree: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-    for pname, bname, vid, vname in db.execute(stmt):
-        tree.setdefault(pname, {}).setdefault(bname, []).append(
-            {"id": vid, "name": vname}
-        )
-    return tree
+def _segment_meta(
+    db: Session,
+    segments: Sequence[Tuple[int, Optional[int]]],
+    attrs_map: Optional[Dict[int, Dict[str, Dict[str, Any]]]] = None,
+) -> Dict[Tuple[int, Optional[int]], Dict[str, Any]]:
+    vids = sorted({vid for vid, _ in segments})
+    vehicles = {
+        v.id: v for v in db.execute(
+            select(Vehicle).where(Vehicle.id.in_(vids))
+        ).scalars()
+    } if vids else {}
+    modes = {
+        m.id: m for m in db.execute(
+            select(VehicleMode).where(
+                VehicleMode.id.in_([mid for _, mid in segments if mid is not None])
+            )
+        ).scalars()
+    } if any(mid is not None for _, mid in segments) else {}
+    if attrs_map is None:
+        attrs_map = load_vehicle_attrs(db, vids)
+
+    out: Dict[Tuple[int, Optional[int]], Dict[str, Any]] = {}
+    for vid, mid in segments:
+        v = vehicles.get(vid)
+        if v is None:
+            continue
+        m = modes.get(mid) if mid is not None else None
+        out[(vid, mid)] = {
+            "vehicle_id": vid,
+            "vehicle_name": v.name,
+            "mode_id": mid,
+            "mode": m.mode if m else None,
+            "attrs": attrs_map.get(vid, {}),
+        }
+    return out
 
 
-# ── API 2: one vehicle × condition ──────────────────────────────────────
-
-def get_vehicle_condition_data(
+def get_segment_condition_data(
     db: Session,
     vehicle_id: int,
     condition_id: int,
+    mode_id: Optional[int] = None,
+    dataset_type: Optional[str] = None,
     exp_nos: Optional[Sequence[str]] = None,
     curve_names: Optional[Set[str]] = None,
     meta_only: bool = False,
     exp_scope: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    vehicle = db.get(Vehicle, vehicle_id)
-    if vehicle is None:
-        return None
     condition = db.get(Condition, condition_id)
     if condition is None:
         return None
+    if db.get(Vehicle, vehicle_id) is None:
+        return None
 
-    experiments = _load_experiments(
-        db, vehicle_id, condition_id, exp_nos,
-        curve_names=curve_names, meta_only=meta_only, exp_scope=exp_scope,
+    seg = (vehicle_id, mode_id)
+    data = _load_datasets(
+        db, [seg], condition_id, dataset_type, exp_nos,
+        curve_names, meta_only, exp_scope,
     )
-    payloads = [_exp_payload(e, curve_names, meta_only) for e in experiments]
+    meta = _segment_meta(db, [seg])[seg]
+    payloads = [_dataset_payload(d, curve_names, meta_only) for d in data.get(seg, [])]
+
     return {
-        "vehicle_id": vehicle_id,
-        "vehicle_name": vehicle.name,
+        "vehicle_id": meta["vehicle_id"],
+        "vehicle_name": meta["vehicle_name"],
+        "mode_id": meta["mode_id"],
+        "mode": meta["mode"],
+        "attrs": meta["attrs"],
         "condition_id": condition_id,
         "condition_name": condition.name,
+        "dataset_type": dataset_type,
         "experiments": payloads,
-        # 单车接口也带上 curve_meta，前端才能用同一套渲染逻辑
         "curve_meta": _collect_curve_meta([{"experiments": payloads}]),
     }
 
 
-# ── API 2b: several vehicles × one condition (comparison) ───────────────
-
 def get_compare(
     db: Session,
-    vehicle_ids: Sequence[int],
+    segments: Sequence[Tuple[int, Optional[int]]],
     condition_id: int,
+    dataset_type: Optional[str] = None,
     exp_nos: Optional[Sequence[str]] = None,
     curve_names: Optional[Set[str]] = None,
     meta_only: bool = False,
     exp_scope: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    """Payload for page 1 – compare N vehicles under one condition."""
     condition = db.get(Condition, condition_id)
     if condition is None:
         return None
 
-    # vehicles in ONE query (with brand + platform joined) …
-    vstmt = (
-        select(Vehicle, Brand.name.label("brand"), Platform.name.label("platform"))
-        .join(Brand, Brand.id == Vehicle.brand_id)
-        .join(Platform, Platform.id == Brand.platform_id)
-        .where(Vehicle.id.in_(list(vehicle_ids)))
-    )
-    vehicles = {
-        v.Vehicle.id: (v.Vehicle, v.brand, v.platform)
-        for v in db.execute(vstmt)
-    }
-
-    # … all their experiments in ONE query
-    exp_map = _load_experiments_bulk(
-        db, vehicle_ids, condition_id, exp_nos,
-        curve_names=curve_names, meta_only=meta_only, exp_scope=exp_scope,
+    metas = _segment_meta(db, segments)
+    data = _load_datasets(
+        db, segments, condition_id, dataset_type, exp_nos,
+        curve_names, meta_only, exp_scope,
     )
 
     out: List[Dict[str, Any]] = []
-    for vid in vehicle_ids:
-        bundle = vehicles.get(vid)
-        if bundle is None:
+    for seg in segments:
+        meta = metas.get(seg)
+        if meta is None:
             continue
-        vehicle, brand_name, platform_name = bundle
-        experiments = exp_map.get(vid, [])
-        if not experiments:
+        datasets = data.get(seg, [])
+        if not datasets:
             continue
         out.append({
-            "vehicle_id": vid,
-            "vehicle_name": vehicle.name,
-            "brand_name": brand_name,
-            "platform_name": platform_name,
-            "drive_type": vehicle.drive_type,
+            "vehicle_id": meta["vehicle_id"],
+            "vehicle_name": meta["vehicle_name"],
+            "mode_id": meta["mode_id"],
+            "mode": meta["mode"],
+            "attrs": meta["attrs"],
             "experiments": [
-                _exp_payload(e, curve_names, meta_only) for e in experiments
+                _dataset_payload(d, curve_names, meta_only) for d in datasets
             ],
         })
 
     return {
         "condition_id": condition_id,
         "condition_name": condition.name,
+        "dataset_type": dataset_type,
         "vehicles": out,
-        # 前端据此渲染曲线选择区：有哪些组、每组有哪些曲线、每条曲线有哪些数据种类
         "curve_meta": _collect_curve_meta(out),
     }
 
 
-# ── API 2c: same thing, but streamed ───────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+# 流式对比
+# ═══════════════════════════════════════════════════════════════════════
 
-#: 流式端点每批取多少条曲线的 series。
-#:
-#: 这是**内存**旋钮，不是速度旋钮：24 条 × 1 万点 × 2 series ≈ 48 万个数字，
-#: 约 15 MB Python 对象，序列化完就丢。调大省 SQL 往返，调小降峰值。
 STREAM_BATCH_CURVES = int(os.getenv("STREAM_BATCH_CURVES", "24"))
 
 
 def iter_compare_stream(
     db: Session,
-    vehicle_ids: Sequence[int],
+    segments: Sequence[Tuple[int, Optional[int]]],
     condition_id: int,
+    dataset_type: Optional[str] = None,
     exp_nos: Optional[Sequence[str]] = None,
     curve_names: Optional[Set[str]] = None,
     exp_scope: Optional[str] = None,
     batch_curves: Optional[int] = None,
 ) -> Iterator[Dict[str, Any]]:
-    """``get_compare`` 的流式版本 —— 逐条产出 NDJSON 对象。
-
-    ── 为什么不复用 ``get_compare`` ──
-
-    那个函数必须先把**整个响应**组装成一个 dict，再 ``json.dumps`` 成一个
-    几百 MB 的字符串。实测服务端内存放大系数 ~8×（ORM 对象 + dict + JSON
-    字符串 + gzip 缓冲），357 MB 的响应峰值 RSS 就是 2.7 GB。
-
-    流式把「持有全量」换成「持有一条曲线」：序列化完一条就交出去，下一轮
-    循环它就能被回收。峰值内存与「选了多少条曲线」无关。
-
-    产出四种行::
-
-        {"type": "meta",  ...}   骨架：车辆 + 指标 + 曲线元信息（无 series）
-        {"type": "curve", ...}   一条曲线的 series，重复 N 次
-        {"type": "done",  ...}   统计 curves / points（HTTP 层再补 ms）
-        {"type": "error", ...}   生成中的异常（此时 200 已经发出去了）
-
-    ``meta`` 行**先发**，前端拿到就能立刻渲染指标表和曲线选择区，
-    不用等最后一条曲线到齐。
-
-    ── 两个内存上的坑（都踩过）──
-
-    1. 取 series 用的是 **Core 查询**（``select(Curve.id, …, Curve.series)``）
-       而不是 ``select(Curve)``。ORM 查询会把每条曲线对象放进 Session 的
-       identity map 并**一直持有**，几百条曲线就把省下来的内存又吃回去了。
-    2. 骨架转成纯 dict 之后立刻 ``expunge_all()``，同理。
-
-    曲线按 ``STREAM_BATCH_CURVES`` 条一批取，每批一次 ``IN`` 查询。
-    """
+    """``get_compare`` 的 NDJSON 流式版本，按 segment 产出骨架 + 逐条曲线。"""
     condition = db.get(Condition, condition_id)
     if condition is None:
         yield {"type": "error", "detail": "Condition not found"}
         return
 
-    # ── 1. 车辆元信息（轻量）──────────────────────────────────────────
-    vstmt = (
-        select(Vehicle, Brand.name.label("brand"), Platform.name.label("platform"))
-        .join(Brand, Brand.id == Vehicle.brand_id)
-        .join(Platform, Platform.id == Brand.platform_id)
-        .where(Vehicle.id.in_(list(vehicle_ids)))
+    metas = _segment_meta(db, segments)
+    data = _load_datasets(
+        db, segments, condition_id, dataset_type, exp_nos,
+        curve_names, meta_only=True, exp_scope=exp_scope,
     )
-    vmeta: Dict[int, Dict[str, Any]] = {}
-    for row in db.execute(vstmt):
-        veh = row.Vehicle
-        vmeta[veh.id] = {
-            "vehicle_id": veh.id,
-            "vehicle_name": veh.name,
-            "brand_name": row.brand,
-            "platform_name": row.platform,
-            "drive_type": veh.drive_type,
-        }
-
-    # ── 2. 实验骨架 + 指标（一次批量；指标是 EAV 小行，不是瓶颈）──────
-    #     curves 走 meta_only 语义：只读标量列，series 留到第 3 步按批取
-    estmt = select(Experiment).where(
-        Experiment.vehicle_id.in_(list(vehicle_ids)),
-        Experiment.condition_id == condition_id,
-    )
-    if exp_nos:
-        estmt = estmt.where(Experiment.experiment_no.in_(list(exp_nos)))
-    estmt = _apply_exp_scope(estmt, exp_scope).options(
-        selectinload(Experiment.indicators),
-        _curve_option(curve_names, meta_only=True),
-    ).order_by(Experiment.vehicle_id, Experiment.sort_order)
-
-    exps = list(db.execute(estmt).scalars().all())
 
     out: List[Dict[str, Any]] = []
-    exp_ids: List[int] = []
-    exp2veh: Dict[int, int] = {}
-    for vid in vehicle_ids:                       # 保持调用方给的顺序
-        meta = vmeta.get(vid)
+    ds_ids: List[int] = []
+    ds2seg: Dict[int, Tuple[int, Optional[int]]] = {}
+    for seg in segments:
+        meta = metas.get(seg)
         if meta is None:
             continue
-        mine = [e for e in exps if e.vehicle_id == vid]
-        if not mine:
+        datasets = data.get(seg, [])
+        if not datasets:
             continue
-        for e in mine:
-            exp_ids.append(e.id)
-            exp2veh[e.id] = vid
-        out.append(dict(meta, experiments=[
-            _exp_payload(e, curve_names, meta_only=True) for e in mine
-        ]))
+        for d in datasets:
+            ds_ids.append(d.id)
+            ds2seg[d.id] = seg
+        out.append({
+            "vehicle_id": meta["vehicle_id"],
+            "vehicle_name": meta["vehicle_name"],
+            "mode_id": meta["mode_id"],
+            "mode": meta["mode"],
+            "attrs": meta["attrs"],
+            "experiments": [
+                _dataset_payload(d, curve_names, meta_only=True) for d in datasets
+            ],
+        })
 
     yield {
         "type": "meta",
         "condition_id": condition_id,
         "condition_name": condition.name,
+        "dataset_type": dataset_type,
         "vehicles": out,
-        # 这里的 curve_meta 没有 series_names（骨架里没有 series）——
-        # 前端本来就把 series_names 当可选字段（见 types.CurveMeta）。
         "curve_meta": _collect_curve_meta(out),
     }
 
-    # 骨架已经变成纯 dict，ORM 对象可以放掉了：它们还挂在 identity map 上，
-    # 不 expunge 的话下面每批的曲线对象会越积越多。
     db.expunge_all()
 
-    # ── 3. 逐批取曲线的 series（唯一的重活）──────────────────────────
     step = batch_curves or STREAM_BATCH_CURVES
     n_curves = 0
     n_points = 0
 
-    if exp_ids:
-        # 先只拿「有哪些曲线」的轻量索引（不带 series 列）
-        #
-        # ⚠️ 排序按**曲线**而不是按实验 —— 这不是为了好看，是**渲染性能**：
-        #
-        #   按实验排（experiment_id, sort_order）→ 每个时间窗口里 7 条曲线都在变
-        #     → 前端每次重绘要重画**全部 7 张图**（25 车 × 3 实验 × 2 series
-        #       = 每图 150 条线），卡顿就是这么来的。
-        #   按曲线排（group, name, experiment_id）→ 同一时间只有**一条**曲线在变
-        #     → 每次重绘只重画对应的**那一张**图。
-        #
-        # 发送顺序不影响正确性：前端是按 (experiment_id, name) 找位置挂数据的。
+    if ds_ids:
         cstmt = (
-            select(Curve.id, Curve.experiment_id, Curve.group)
-            .where(Curve.experiment_id.in_(exp_ids))
-            .order_by(Curve.group, Curve.name, Curve.experiment_id)
+            select(Curve.id, Curve.dataset_id, Curve.group)
+            .where(Curve.dataset_id.in_(ds_ids))
+            .order_by(Curve.group, Curve.name, Curve.dataset_id)
         )
         if curve_names:
             cstmt = cstmt.where(Curve.name.in_(list(curve_names)))
@@ -609,380 +1236,188 @@ def iter_compare_stream(
                 ).where(Curve.id.in_([k.id for k in chunk]))
             ).all()
             by_id = {r.id: r for r in rows}
-            for k in chunk:                       # 按 chunk 顺序发，保证稳定
+            for k in chunk:
                 row = by_id.get(k.id)
                 if row is None:
                     continue
                 payload = _curve_payload(row)
                 n_curves += 1
                 n_points += payload["point_count"]
+                seg = ds2seg.get(k.dataset_id) or (None, None)
                 yield {
                     "type": "curve",
-                    "vehicle_id": exp2veh.get(k.experiment_id),
-                    "experiment_id": k.experiment_id,
+                    "vehicle_id": seg[0],
+                    "mode_id": seg[1],
+                    "dataset_id": k.dataset_id,
                     "group": k.group,
                     "curve": payload,
                 }
-            del rows, by_id                       # 早点让这一批可以被回收
+            del rows, by_id
 
     yield {"type": "done", "curves": n_curves, "points": n_points}
 
 
-# ── API 3: all indicators nested by hierarchy ──────────────────────────
+# ═══════════════════════════════════════════════════════════════════════
+# 指标统计（分页 / 动态字段列）
+# ═══════════════════════════════════════════════════════════════════════
 
-def _indicator_stmt(
-    platform_name: Optional[str],
-    condition_name: Optional[str],
-    indicator_name: Optional[str],
-    average_only: bool = False,
-):
-    stmt = (
-        select(
-            Platform.name.label("platform"),
-            Brand.name.label("brand"),
-            Vehicle.name.label("vehicle"),
-            Condition.name.label("condition"),
-            Experiment.experiment_no.label("exp_no"),
-            Experiment.is_average.label("is_average"),
-            Experiment.sort_order.label("sort_order"),
-            Indicator.raw_key.label("raw_key"),
-            Indicator.name.label("ind_name"),
-            Indicator.unit.label("unit"),
-            Indicator.value,
-            Indicator.text_value,
-        )
-        .join(Brand, Brand.platform_id == Platform.id)
-        .join(Vehicle, Vehicle.brand_id == Brand.id)
-        .join(Experiment, Experiment.vehicle_id == Vehicle.id)
-        .join(Condition, Condition.id == Experiment.condition_id)
-        .join(Indicator, Indicator.experiment_id == Experiment.id)
-        .order_by(
-            Platform.name, Brand.name, Vehicle.name,
-            Condition.name, Experiment.sort_order,
-            Indicator.name, Indicator.raw_key,
-        )
-    )
-    if platform_name:
-        stmt = stmt.where(Platform.name == platform_name)
-    if condition_name:
-        stmt = stmt.where(Condition.name == condition_name)
-    if indicator_name:
-        stmt = stmt.where(Indicator.name == indicator_name)
-    # 「仅平均」在 SQL 里过滤 —— 否则分页 total 会把非平均实验也算进去
-    if average_only:
-        stmt = stmt.where(Experiment.is_average.is_(True))
-    return stmt
-
-
-def get_all_indicators(
+def _filter_vehicle_ids_for_stats(
     db: Session,
-    platform_name: Optional[str] = None,
-    condition_name: Optional[str] = None,
-    indicator_name: Optional[str] = None,
-    average_only: bool = False,
-) -> Dict[str, Any]:
-    """Return all indicators nested as::
-
-        platform → brand → vehicle → condition → experiment_no → {raw_key: {value, unit}}
-
-    Full scale warning: this is ~350k indicator values for 200 cars × 20 工况.
-    Use ``get_all_indicators_flat`` with paging for the real table view.
-    """
-    result: Dict[str, Any] = {}
-    for row in db.execute(
-        _indicator_stmt(platform_name, condition_name, indicator_name, average_only)
-    ):
-        (
-            result
-            .setdefault(row.platform, {})
-            .setdefault(row.brand, {})
-            .setdefault(row.vehicle, {})
-            .setdefault(row.condition, {})
-            .setdefault(row.exp_no, {})
-        )[row.raw_key] = {
-            "value": row.value,
-            "text_value": row.text_value,
-            "unit": row.unit,
-            "name": row.ind_name,
-        }
-    return result
+    filters: Dict[str, str],
+) -> Tuple[Optional[List[int]], Dict[int, Dict[str, Dict[str, Any]]]]:
+    """按任意 attr 过滤车辆，返回 (允许的车辆 id 或 None, 属性表)。"""
+    attrs_map = load_vehicle_attrs(db)
+    if not filters:
+        return None, attrs_map
+    allow = _filter_vehicle_ids(attrs_map, filters)
+    return sorted(allow), attrs_map
 
 
 def _indicator_key_stmt(
-    platform_name: Optional[str],
+    vehicle_ids: Optional[Sequence[int]],
     condition_name: Optional[str],
     indicator_name: Optional[str],
-    average_only: bool = False,
+    average_only: bool,
+    dataset_type: Optional[str],
+    mode_id: Optional[int] = None,
+    condition_id: Optional[int] = None,
 ):
-    """实验级「一行」的 key（不含指标值），供 SQL 侧分页使用。
-
-    与 ``_indicator_stmt`` 的区别：那个是 (实验 × 指标) 的笛卡尔展开，
-    200 车 × 20 工况 × 30 指标 ≈ 35 万行；这个每个实验只出一行
-    （≈ 1.2 万行），所以 ``COUNT`` / ``LIMIT`` / ``OFFSET`` 都能真正下推。
-    """
     stmt = (
         select(
-            Experiment.id.label("exp_id"),
-            Experiment.experiment_no.label("exp_no"),
-            Experiment.is_average.label("is_average"),
-            Experiment.sort_order.label("sort_order"),
-            Platform.name.label("platform"),
-            Brand.name.label("brand"),
+            Dataset.id.label("dataset_id"),
+            Dataset.exp_no.label("exp_no"),
+            Dataset.is_average.label("is_average"),
+            Dataset.sort_order.label("sort_order"),
+            Dataset.mode_id.label("mode_id"),
+            Vehicle.id.label("vehicle_id"),
             Vehicle.name.label("vehicle"),
+            VehicleMode.mode.label("mode"),
             Condition.name.label("condition"),
         )
-        .join(Vehicle, Vehicle.id == Experiment.vehicle_id)
-        .join(Brand, Brand.id == Vehicle.brand_id)
-        .join(Platform, Platform.id == Brand.platform_id)
-        .join(Condition, Condition.id == Experiment.condition_id)
+        .join(Vehicle, Vehicle.id == Dataset.vehicle_id)
+        .outerjoin(VehicleMode, VehicleMode.id == Dataset.mode_id)
+        .join(Condition, Condition.id == Dataset.condition_id)
     )
-    if platform_name:
-        stmt = stmt.where(Platform.name == platform_name)
-    if condition_name:
+    if dataset_type:
+        stmt = stmt.join(
+            DatasetType, DatasetType.id == Dataset.dataset_type_id
+        ).where(DatasetType.code == dataset_type)
+    if vehicle_ids is not None:
+        stmt = stmt.where(Dataset.vehicle_id.in_(list(vehicle_ids)))
+    if mode_id is not None:
+        stmt = stmt.where(Dataset.mode_id == mode_id)
+    if condition_id is not None:
+        stmt = stmt.where(Dataset.condition_id == condition_id)
+    elif condition_name:
         stmt = stmt.where(Condition.name == condition_name)
     if average_only:
-        stmt = stmt.where(Experiment.is_average.is_(True))
+        stmt = stmt.where(Dataset.is_average.is_(True))
     if indicator_name:
-        # 只保留「确实有该指标」的实验 —— 否则 total 会把空实验也算进去
-        stmt = stmt.where(
-            exists().where(and_(
-                Indicator.experiment_id == Experiment.id,
-                Indicator.name == indicator_name,
-            ))
-        )
+        stmt = stmt.where(exists().where(and_(
+            MetricValue.dataset_id == Dataset.id,
+            MetricValue.name == indicator_name,
+        )))
     return stmt
 
 
 def get_all_indicators_flat(
     db: Session,
-    platform_name: Optional[str] = None,
+    filters: Optional[Dict[str, str]] = None,
     condition_name: Optional[str] = None,
     indicator_name: Optional[str] = None,
     average_only: bool = False,
+    dataset_type: Optional[str] = None,
+    mode_id: Optional[int] = None,
     limit: int = 200,
     offset: int = 0,
+    condition_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Paged, table-ready variant of ``get_all_indicators``.
+    """分页的指标统计表。
 
-    One row per (platform, brand, vehicle, condition, experiment_no); the
-    indicators live in a ``{raw_key: {value, unit, …}}`` map so the front-end
-    can turn them into columns.
-
-    ``average_only=True`` keeps just the 平均 run of every vehicle × condition
-    (a vehicle may have an arbitrary number of non-average runs, or none).
-
-    分页是**在 SQL 里做的**：先在实验级 key 上 ``COUNT`` / ``ORDER BY … LIMIT
-    OFFSET``，再只为这一页的实验取指标。以前是先把 35 万行全读进内存、
-    在 Python 里 groupby 完再切片 —— 翻到第 2 页和第 1 页一样贵，
-    而且 200 车时那份 list 本身就有几百 MB。
-
-    Returns ``{total, offset, limit, rows}``.
+    每行一个「车 × 模式 × 工况 × 实验」，``attrs`` 是车辆动态属性，
+    ``indicators`` 是 ``{raw_key: {...}}``。字段列由前端按 ``/api/meta``
+    决定，后端不再写死平台 / 品牌。
     """
-    key_stmt = _indicator_key_stmt(
-        platform_name, condition_name, indicator_name, average_only
-    )
+    vehicle_ids, attrs_map = _filter_vehicle_ids_for_stats(db, filters or {})
+    if vehicle_ids is not None and not vehicle_ids:
+        return {"total": 0, "offset": offset, "limit": limit, "rows": []}
 
-    total = int(
-        db.execute(select(func.count()).select_from(key_stmt.subquery())).scalar() or 0
+    key_stmt = _indicator_key_stmt(
+        vehicle_ids, condition_name, indicator_name, average_only,
+        dataset_type, mode_id, condition_id,
     )
+    total = int(db.execute(
+        select(func.count()).select_from(key_stmt.subquery())
+    ).scalar() or 0)
 
     page_stmt = key_stmt.order_by(
-        Platform.name, Brand.name, Vehicle.name,
-        Condition.name, Experiment.sort_order, Experiment.experiment_no,
+        Vehicle.name, VehicleMode.mode, Condition.name,
+        Dataset.sort_order, Dataset.exp_no,
     ).offset(offset)
     if limit:
         page_stmt = page_stmt.limit(limit)
     keys = list(db.execute(page_stmt))
 
-    # 只为这一页的实验取指标（一次 IN 查询）
-    exp_ids = [k.exp_id for k in keys]
+    ds_ids = [k.dataset_id for k in keys]
     ind_map: Dict[int, Dict[str, Any]] = {}
-    if exp_ids:
+    if ds_ids:
         istmt = (
             select(
-                Indicator.experiment_id,
-                Indicator.raw_key,
-                Indicator.name,
-                Indicator.unit,
-                Indicator.value,
-                Indicator.text_value,
+                MetricValue.dataset_id, MetricValue.raw_key, MetricValue.name,
+                MetricValue.unit, MetricValue.value, MetricValue.text_value,
             )
-            .where(Indicator.experiment_id.in_(exp_ids))
-            .order_by(Indicator.name, Indicator.raw_key)
+            .where(MetricValue.dataset_id.in_(ds_ids))
+            .order_by(MetricValue.name, MetricValue.raw_key)
         )
-        for eid, raw_key, iname, iunit, ivalue, itext in db.execute(istmt):
-            ind_map.setdefault(eid, {})[raw_key] = {
-                "value": ivalue,
-                "text_value": itext,
-                "unit": iunit,
-                "name": iname,
+        for dsid, raw_key, name, unit, value, text in db.execute(istmt):
+            ind_map.setdefault(dsid, {})[raw_key] = {
+                "value": value, "text_value": text,
+                "unit": unit, "name": name,
             }
 
-    rows = [
-        {
-            "platform": k.platform,
-            "brand": k.brand,
+    rows = []
+    for k in keys:
+        rows.append({
+            "vehicle_id": k.vehicle_id,
             "vehicle": k.vehicle,
+            "mode_id": k.mode_id,
+            "mode": k.mode,
             "condition": k.condition,
-            "experiment_no": k.exp_no,
+            "dataset_id": k.dataset_id,
+            "exp_no": k.exp_no,
             "is_average": bool(k.is_average),
-            "indicators": ind_map.get(k.exp_id, {}),
-        }
-        for k in keys
-    ]
+            "attrs": attrs_map.get(k.vehicle_id, {}),
+            "indicators": ind_map.get(k.dataset_id, {}),
+        })
 
-    return {
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-        "rows": rows,
-    }
+    return {"total": total, "offset": offset, "limit": limit, "rows": rows}
 
 
-def count_indicator_rows(
-    db: Session,
-    platform_name: Optional[str] = None,
-    condition_name: Optional[str] = None,
-    average_only: bool = False,
-) -> int:
-    """Number of experiment-level rows (for the page-2 pager)."""
-    stmt = (
-        select(func.count())
-        .select_from(Experiment)
-        .join(Vehicle, Vehicle.id == Experiment.vehicle_id)
-        .join(Brand, Brand.id == Vehicle.brand_id)
-        .join(Platform, Platform.id == Brand.platform_id)
-        .join(Condition, Condition.id == Experiment.condition_id)
-    )
-    if platform_name:
-        stmt = stmt.where(Platform.name == platform_name)
-    if condition_name:
-        stmt = stmt.where(Condition.name == condition_name)
-    if average_only:
-        stmt = stmt.where(Experiment.is_average.is_(True))
-    return int(db.execute(stmt).scalar() or 0)
+# ═══════════════════════════════════════════════════════════════════════
+# 规模估算
+# ═══════════════════════════════════════════════════════════════════════
 
-
-# ── supporting queries ──────────────────────────────────────────────────
-
-def get_conditions(db: Session) -> List[Dict[str, Any]]:
-    rows = db.query(Condition).order_by(Condition.name).all()
-    return [
-        {"id": c.id, "name": c.name, "description": c.description, "category": c.category}
-        for c in rows
-    ]
-
-
-def get_vehicle_conditions(db: Session, vehicle_id: int) -> List[Dict[str, Any]]:
-    """Conditions that have at least one experiment for the given vehicle."""
-    vehicle = db.get(Vehicle, vehicle_id)
-    if vehicle is None:
-        return []
-
-    stmt = (
-        select(Condition.id, Condition.name, Condition.description, Condition.category)
-        .join(Experiment, Experiment.condition_id == Condition.id)
-        .where(Experiment.vehicle_id == vehicle_id)
-        .distinct()
-        .order_by(Condition.name)
-    )
-    return [
-        {"id": r[0], "name": r[1], "description": r[2], "category": r[3]}
-        for r in db.execute(stmt)
-    ]
-
-
-def get_vehicle_conditions_bulk(
-    db: Session, vehicle_ids: Sequence[int]
-) -> Dict[int, List[Dict[str, Any]]]:
-    """Conditions available per vehicle — one query for the whole selection."""
-    stmt = (
-        select(
-            Experiment.vehicle_id,
-            Condition.id, Condition.name, Condition.description, Condition.category,
-        )
-        .join(Condition, Condition.id == Experiment.condition_id)
-        .where(Experiment.vehicle_id.in_(list(vehicle_ids)))
-        .distinct()
-        .order_by(Condition.name)
-    )
-    out: Dict[int, List[Dict[str, Any]]] = {}
-    seen = set()
-    for vid, cid, cname, cdesc, ccat in db.execute(stmt):
-        key = (vid, cid)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.setdefault(vid, []).append(
-            {"id": cid, "name": cname, "description": cdesc, "category": ccat}
-        )
-    return out
-
-
-def get_vehicles_brief(db: Session) -> List[Dict[str, Any]]:
-    """Flat vehicle list with platform/brand for the front-end selector."""
-    stmt = (
-        select(
-            Vehicle.id, Vehicle.name, Vehicle.drive_type,
-            Brand.name.label("brand"), Platform.name.label("platform"),
-        )
-        .join(Brand, Brand.id == Vehicle.brand_id)
-        .join(Platform, Platform.id == Brand.platform_id)
-        .order_by(Platform.name, Brand.name, Vehicle.name)
-    )
-    return [
-        {"id": r[0], "name": r[1], "drive_type": r[2], "brand": r[3], "platform": r[4]}
-        for r in db.execute(stmt)
-    ]
-
-
-def get_curve_names(db: Session, condition_id: int) -> List[str]:
-    """Distinct curve names under a condition (lets the UI pick subsets)."""
-    stmt = (
-        select(Curve.name)
-        .join(Experiment, Experiment.id == Curve.experiment_id)
-        .where(Experiment.condition_id == condition_id)
-        .distinct()
-        .order_by(Curve.name)
-    )
-    return [r[0] for r in db.execute(stmt)]
-
-
-# ── 规模估算（防 OOM 的准入检查） ───────────────────────────────────────
-
-#: 单条曲线里的 series 条数取不到便宜的方式，按「原始数据 + 滤波」估 2 条
 _ASSUMED_SERIES_PER_CURVE = 2
 
 
 def estimate_compare_numbers(
     db: Session,
-    vehicle_count: int,
+    segment_count: int,
     condition_id: int,
     curve_names: Optional[Set[str]] = None,
     exp_scope: Optional[str] = None,
+    dataset_type: Optional[str] = None,
 ) -> int:
-    """粗估一次 /api/compare 会返回多少个数字（不是字节）。
-
-    为什么不用「车辆数上限」：那个尺度是错的。200 台车只画 1 条曲线
-    （实测 34 MB）完全没问题，而 50 台车画全部 7 条曲线（357 MB）才是
-    会崩的那个。所以按**实际负载**卡，而不是按车辆数卡。
-
-    估算公式::
-
-        车辆数 × 实验数 × 曲线数 × series条数 × 单曲线点数 × 2(x,y)
-
-    精度不重要 —— 它只需要区分「30 万」和「4000 万」两个数量级。
-    ``Curve.point_count`` 是冗余列（导入时写好的采样点数），所以这里
-    不需要解析任何 JSONB。
-    """
-    row = db.execute(
-        select(
-            func.max(Curve.point_count),
-            func.count(func.distinct(Curve.name)),
-        )
-        .join(Experiment, Experiment.id == Curve.experiment_id)
-        .where(Experiment.condition_id == condition_id)
-    ).one()
+    stmt = (
+        select(func.max(Curve.point_count), func.count(func.distinct(Curve.name)))
+        .join(Dataset, Dataset.id == Curve.dataset_id)
+        .where(Dataset.condition_id == condition_id)
+    )
+    if dataset_type:
+        stmt = stmt.join(
+            DatasetType, DatasetType.id == Dataset.dataset_type_id
+        ).where(DatasetType.code == dataset_type)
+    row = db.execute(stmt).one()
     max_points = int(row[0] or 0)
     n_curves = len(curve_names) if curve_names else int(row[1] or 0)
     if not max_points or not n_curves:
@@ -991,14 +1426,144 @@ def estimate_compare_numbers(
     if exp_scope == "avg_first":
         n_exps = 1
     else:
+        count_stmt = select(func.count(Dataset.id)).where(
+            Dataset.condition_id == condition_id
+        )
+        if dataset_type:
+            count_stmt = count_stmt.join(
+                DatasetType, DatasetType.id == Dataset.dataset_type_id
+            ).where(DatasetType.code == dataset_type)
         counts = list(db.execute(
-            select(func.count(Experiment.id))
-            .where(Experiment.condition_id == condition_id)
-            .group_by(Experiment.vehicle_id)
+            count_stmt.group_by(Dataset.vehicle_id, Dataset.mode_id)
         ).scalars())
         n_exps = max(counts) if counts else 1
 
-    return (
-        vehicle_count * n_exps * n_curves
-        * _ASSUMED_SERIES_PER_CURVE * max_points * 2
+    return segment_count * n_exps * n_curves * _ASSUMED_SERIES_PER_CURVE * max_points * 2
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 车辆列表 / 字段注册表维护
+# ═══════════════════════════════════════════════════════════════════════
+
+def list_vehicles_brief(
+    db: Session,
+    filters: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """车辆扁平列表：动态属性 + 模式 + 数据集数量。"""
+    vehicles = list(db.execute(select(Vehicle).order_by(Vehicle.name)).scalars())
+    vids = [v.id for v in vehicles]
+    attrs_map = load_vehicle_attrs(db, vids)
+    modes_map = _vehicle_modes(db, vids)
+    if filters:
+        allow = _filter_vehicle_ids(attrs_map, filters)
+    else:
+        allow = None
+
+    counts: Dict[int, int] = {}
+    if vids:
+        for vid, n in db.execute(
+            select(Dataset.vehicle_id, func.count(Dataset.id))
+            .where(Dataset.vehicle_id.in_(vids))
+            .group_by(Dataset.vehicle_id)
+        ):
+            counts[vid] = int(n)
+
+    out: List[Dict[str, Any]] = []
+    for v in vehicles:
+        if allow is not None and v.id not in allow:
+            continue
+        out.append({
+            "id": v.id,
+            "name": v.name,
+            "attrs": {
+                code: val.get("value") for code, val in attrs_map.get(v.id, {}).items()
+            },
+            "modes": [
+                {"id": m.id, "mode": m.mode, "sort_order": m.sort_order}
+                for m in modes_map.get(v.id, [])
+            ],
+            "dataset_count": counts.get(v.id, 0),
+        })
+    return out
+
+
+def get_attr_defs(db: Session, active_only: bool = False) -> List[AttrDef]:
+    return _attr_defs(db, active_only=active_only)
+
+
+def _attr_code_for(name: str) -> str:
+    """给中文列名生成稳定、可读性尚可的 code。"""
+    import hashlib
+    import re
+
+    candidate = re.sub(r"[^a-zA-Z0-9_]+", "_", name).strip("_").lower()
+    if candidate:
+        return candidate[:50]
+    return "f_" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+
+
+def create_attr_def(db: Session, data: Dict[str, Any]) -> AttrDef:
+    name = str(data.get("name") or "").strip()
+    if not name:
+        raise ValueError("字段名称不能为空")
+    code = str(data.get("code") or "").strip() or _attr_code_for(name)
+    if db.execute(select(AttrDef).where(AttrDef.code == code)).scalars().first():
+        raise ValueError("字段 code 已存在：%s" % code)
+    value_type = str(data.get("value_type") or "text")
+    if value_type not in ("text", "number", "bool", "date", "dim"):
+        raise ValueError("value_type 只能是 text/number/bool/date/dim")
+    if value_type == "dim" and not data.get("dim_code"):
+        raise ValueError("dim 类型字段必须指定 dim_code")
+
+    attr = AttrDef(
+        code=code,
+        name=name,
+        value_type=value_type,
+        dim_code=(data.get("dim_code") or None),
+        unit=(data.get("unit") or None),
+        required=bool(data.get("required", False)),
+        show_in_list=bool(data.get("show_in_list", True)),
+        options=data.get("options"),
+        sort_order=int(data.get("sort_order") or 0),
+        is_active=True,
     )
+    db.add(attr)
+    db.commit()
+    db.refresh(attr)
+    return attr
+
+
+def update_attr_def(
+    db: Session, attr_id: int, data: Dict[str, Any],
+) -> Optional[AttrDef]:
+    attr = db.get(AttrDef, attr_id)
+    if attr is None:
+        return None
+    for key in ("name", "unit", "dim_code", "value_type", "options"):
+        if key in data:
+            setattr(attr, key, data.get(key))
+    for key in ("required", "show_in_list", "is_active"):
+        if key in data:
+            setattr(attr, key, bool(data.get(key)))
+    if "sort_order" in data:
+        attr.sort_order = int(data.get("sort_order") or 0)
+    db.commit()
+    db.refresh(attr)
+    return attr
+
+
+def get_indicator_names(
+    db: Session,
+    condition_id: Optional[int] = None,
+    dataset_type: Optional[str] = None,
+) -> List[str]:
+    stmt = select(MetricValue.name).distinct().order_by(MetricValue.name)
+    if condition_id is not None or dataset_type:
+        stmt = stmt.join(Dataset, Dataset.id == MetricValue.dataset_id)
+        if condition_id is not None:
+            stmt = stmt.where(Dataset.condition_id == condition_id)
+        if dataset_type:
+            stmt = stmt.join(
+                DatasetType, DatasetType.id == Dataset.dataset_type_id
+            ).where(DatasetType.code == dataset_type)
+    return [r[0] for r in db.execute(stmt)]
