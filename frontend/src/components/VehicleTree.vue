@@ -15,7 +15,7 @@
  * 叶子是 `kind='segment'`（车 × 试验模式），勾选结果直接就是对比/取数接口
  * 需要的分析单元，不再经过「车 id 列表」这一层中间态。
  */
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { getMeta, getTree } from '@/api'
 import type { Meta, NavNode, NavTree, SegmentRef, TreeLevel } from '@/types'
@@ -160,11 +160,9 @@ function selectSubtree(node: NavNode) {
   emitChecked()
 }
 
-/** 按 `selected` prop 恢复勾选（对比页刷新 / 切换树后使用） */
-function restoreSelection() {
-  const want = new Set(
-    (props.selected ?? []).map((s) => `${s.vehicle_id}:${s.mode_id ?? ''}`),
-  )
+/** 按给定的分析单元恢复勾选（对比页刷新 / 切换树后使用） */
+function restoreSelection(segs: SegmentRef[] = props.selected ?? []) {
+  const want = new Set(segs.map((s) => `${s.vehicle_id}:${s.mode_id ?? ''}`))
   if (!want.size) {
     treeRef.value?.setCheckedKeys([], false)
     emitChecked()
@@ -192,6 +190,9 @@ function restoreSelection() {
 
 async function load(profile?: string) {
   loading.value = true
+  // 切换前记下当前选中的分析单元。segment 是「车 × 模式」，与层级无关，
+  // 换一套导航方式后这些单元依然存在 —— 所以要跟着走，不能丢。
+  const keep = checkedSegments.value.slice()
   try {
     const [m, t] = await Promise.all([getMeta(), getTree(profile)])
     meta.value = m
@@ -199,12 +200,23 @@ async function load(profile?: string) {
     applyingProfile = true
     profileCode.value = t.profile?.code ?? ''
     applyingProfile = false
-    // 树换了：上一棵树里的 key 不能留到新树里
+
+    // 等 el-tree 用新数据重建完，再动勾选状态。
+    //
+    // 必须显式 setCheckedKeys([])：segment 的 node-key 是
+    // `seg|<车id>|<模式id>`，**不含层级索引**，换 profile 后这些 key
+    // 照样命中旧勾选。以前只把 checkedSegments 置空、不碰 el-tree，
+    // 结果就是「复选框全勾着，但实际一个都没选中」。
+    await nextTick()
+    treeRef.value?.setCheckedKeys([], false)
     checkedSegments.value = []
-    emit('change', [])
-    if (props.selected?.length) {
-      // 等 el-tree 渲染出节点后再 setCheckedKeys
-      requestAnimationFrame(() => restoreSelection())
+
+    // 外部指定的选中优先（对比页带过来的），否则沿用切换前的选择
+    const wanted = props.selected?.length ? props.selected : keep
+    if (wanted.length) {
+      restoreSelection(wanted)
+    } else {
+      emit('change', [])
     }
   } catch (e: any) {
     ElMessage.error(e.message || '导航树加载失败')

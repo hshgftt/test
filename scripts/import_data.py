@@ -18,6 +18,15 @@
 
 即 **一台车一个文件夹，一个工况一个文件**。
 
+**文件名不必是工况名。** 文件名只是「候选」——命中已知工况（库里已有的、
+或 ``conditions.csv`` 里列出的）就直接采信；命中不了就靠内容里的指标名反推
+（同一工况的指标组合是稳定的）。所以下面这样命名一样能正确归工况::
+
+    data/星河EV-01/20241021-001.cw
+    data/星河EV-01/随便起的名字.json
+
+两样都认不出来时，才退回用文件名当工况名（不丢数据）。
+
 文件格式：JSON 或 msgpack
 -------------------------
 
@@ -26,6 +35,7 @@
 ============================  ==========================
 `.json`                       标准 JSON（utf-8，可带 BOM）
 `.msgpack` `.msg` `.mpack`    msgpack；**算法侧常见的落盘格式**
+`.cw`                         业务侧自定义后缀，内容同样是 msgpack
 ============================  ==========================
 
 msgpack 需要额外装库：``pip install msgpack``。
@@ -127,7 +137,7 @@ def main() -> int:
                     help="保留现有数据，按「车 × 工况」覆盖导入（默认会先清空）")
     ap.add_argument("--dry-run", action="store_true", help="只预览，不写库")
     ap.add_argument("--ext", default=None,
-                    help="只认指定后缀，逗号分隔。默认 .json,.msgpack,.msg,.mpack")
+                    help="只认指定后缀，逗号分隔。默认 .json,.msgpack,.msg,.mpack,.cw")
     args = ap.parse_args()
 
     exts: Tuple[str, ...] = READABLE_EXTS
@@ -138,8 +148,23 @@ def main() -> int:
         )
 
     t0 = time.time()
+
+    # 工况索引：用库里已有数据做「工况 → 指标名」对照，供文件名随便起时识别。
+    # 必须在 reset_schema 之前取 —— 全量重导时正是靠上一版数据来认工况。
+    try:
+        _idx_db = SessionLocal()
+        try:
+            condition_index = importer.build_condition_index(_idx_db)
+        finally:
+            _idx_db.close()
+    except Exception as exc:                      # noqa: BLE001 — 空库/没建表
+        print("  (工况索引不可用，跳过按内容识别工况: %s)" % exc)
+        condition_index = {}
+
     print("扫描数据目录: %s  （后缀 %s）" % (args.data_dir, ", ".join(exts)))
-    meta = importer.scan_dir(args.data_dir, exts=exts)
+    meta = importer.scan_dir(
+        args.data_dir, exts=exts, condition_index=condition_index,
+    )
 
     # 显式指定的 CSV 优先于目录里自动找到的
     if args.vehicles_csv:
@@ -157,6 +182,16 @@ def main() -> int:
         return 1
 
     print(importer.preview_text(items, meta))
+
+    for it in meta.get("inferred_conditions") or []:
+        print("  · 文件名「%s」→ 按指标内容识别为「%s」"
+              % (it["filename"], it["condition"]))
+    unresolved = meta.get("unresolved_conditions") or []
+    if unresolved:
+        print("  · %d 个文件既不像工况名、内容也认不出，按文件名建工况：" % len(unresolved))
+        for it in unresolved[:5]:
+            cand = "、".join(it.get("candidates") or []) or "无"
+            print("      %s（最像：%s）" % (it["file"], cand))
 
     if args.dry_run:
         print("\n--dry-run：未写库。样例：")

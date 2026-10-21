@@ -341,6 +341,11 @@ export interface UploadResult {
   error_count: number
   skipped: string[]
   skipped_count: number
+  /** 文件名不像工况名、靠内容里的指标名改判成功的 */
+  inferred_conditions: { file: string; filename: string; condition: string }[]
+  inferred_count: number
+  /** 文件名和内容都定不下来，只能拿文件名当工况的 */
+  unresolved_conditions: { file: string; filename: string; candidates: string[] }[]
 }
 
 export interface UploadOptions {
