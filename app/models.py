@@ -18,6 +18,7 @@ Schema overview
     数据层
       datasets        N──1 conditions / dataset_types / vehicle_modes / test_orders
                       1──N metric_values
+                      1──N curves
 
 Design rationale
 ----------------
@@ -39,12 +40,21 @@ Design rationale
   对比、取数都以它为单位；``datasets.mode_id`` 可空（该车没有模式时）。
 
 * **数据格式不写死。** ``datasets`` 是统一信封：一条数据一行，
-  ``dataset_type_id`` 决定 payload 的结构含义，``payload``（JSONB）
-  整块存原始结构。新增格式 = 在 ``dataset_types`` 加一行，
-  不需要 ALTER TABLE，也不需要拆新表。
+  ``dataset_type_id`` 决定这条数据怎么解释。新增格式 = 在
+  ``dataset_types`` 加一行，不需要 ALTER TABLE。
 
-* **标量单独抽一层。** 只有需要跨车统计/筛选的数值才写入
-  ``metric_values``；曲线等大块结构留在 ``datasets.payload`` 里。
+* **大块数据按用途拆开存，不塞进一个 payload。** 这是旧版最关键的性能设计，
+  不能丢：
+
+  - 标量指标 → ``metric_values``（EAV）。跨车统计、按指标名筛选都走这张表。
+  - 曲线 → ``curves``，**一条曲线一行**，``series`` 整块 JSONB，
+    另存 ``point_count``。这样 ``curves=`` 只勾选部分曲线时可以下推到 SQL
+    （``selectinload`` 只加载选中的行），``meta_only`` 也能完全不碰
+    ``series`` —— 曲线单条可达 10 万点，一条 dataset 一个 payload 的话，
+    读任何一条线都得把全部线反序列化出来。
+  - 其余无法归入上面两类的内容 → ``datasets.payload``（可空）。新格式如果
+    自带特殊结构，放这里；有标量和曲线的部分仍走前两张表。
+
   指标名与旧版一致按 EAV 存，``raw_key`` 原样保留，数字前缀不入库。
 """
 from __future__ import annotations
@@ -331,15 +341,21 @@ class TestOrder(Base):
 # ── 数据层 ─────────────────────────────────────────────────────────────
 
 class Dataset(Base):
-    """统一数据信封 — 一条数据集一行，payload 存原始结构.
+    """统一数据信封 — 一条数据集（≈ 一次实验）一行.
 
-    对应导入时的一个数据文件（如 ``舒适/角阶跃.json``）。关系全部
-    抽成外键，payload 保持原样：
+    对应导入数据里的一个实验号（如 ``舒适/角阶跃.json`` 里的 ``'1'``）。
+    关系全部抽成外键：
 
     * ``mode_id``       该数据属于哪个试验模式（无模式的车可空）
     * ``test_order_id`` 关联的操稳/平顺单号（单号缺失时可空）
     * ``condition_id``  工况
-    * ``dataset_type_id`` 数据格式（决定 payload 的含义）
+    * ``dataset_type_id`` 数据格式（决定这条数据怎么解释）
+
+    数据本身按用途分三处，payload 只做兜底，不是原始文件的完整拷贝：
+
+    * 标量指标 → ``metric_values``
+    * 曲线     → ``curves``（一条曲线一行，整块 JSONB）
+    * 其余结构 → ``payload``（可空）
 
     ``exp_no`` 仍是字符串（``'1'`` / ``'2'`` / ``'平均'``），
     ``is_average`` + ``sort_order`` 保证排序稳定。
@@ -364,13 +380,11 @@ class Dataset(Base):
         ForeignKey("dataset_types.id"), index=True,
     )
     name: Mapped[str] = mapped_column(String(300))                     # 文件 / 数据集名
-    source_path: Mapped[Optional[str]] = mapped_column(String(1000))   # 导入时的相对路径
     exp_no: Mapped[str] = mapped_column(String(20), default="1")       # '1' / '2' / '平均'
     is_average: Mapped[bool] = mapped_column(default=False)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
-    payload: Mapped[Dict[str, Any]] = mapped_column(JSONType)          # 任意结构，格式由 type 决定
-    # 冗余采样点数：曲线接口估算负载用，避免为了知道长度去解析 payload
-    point_count: Mapped[Optional[int]] = mapped_column(Integer)
+    # 兜底容器：只放无法归入 metric_values / curves 的结构，可为空
+    payload: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSONType)
     created_at: Mapped[datetime] = mapped_column(server_default=func.now())
 
     vehicle: Mapped["Vehicle"] = relationship(back_populates="datasets")
@@ -379,6 +393,9 @@ class Dataset(Base):
     condition: Mapped["Condition"] = relationship(back_populates="datasets")
     dataset_type: Mapped["DatasetType"] = relationship(back_populates="datasets")
     metrics: Mapped[List["MetricValue"]] = relationship(
+        back_populates="dataset", cascade="all, delete-orphan",
+    )
+    curves: Mapped[List["Curve"]] = relationship(
         back_populates="dataset", cascade="all, delete-orphan",
     )
 
@@ -419,4 +436,46 @@ class MetricValue(Base):
     __table_args__ = (
         Index("ix_metric_values_dataset_name", "dataset_id", "name"),
         Index("ix_metric_values_name", "name"),
+    )
+
+
+# ── 曲线 ───────────────────────────────────────────────────────────────
+
+class Curve(Base):
+    """曲线 — 一条曲线一行，series 整块 JSONB（沿用旧版存储策略）.
+
+    为什么必须独立成表：
+
+    * 曲线只会整体取回来画图，不会按 y 值查询，所以整块 JSONB 是 O(1)
+      读取，不需要拆 ``points(curve_id, x, y)``。
+    * 单条曲线可达 10 万点，一条数据集的全部曲线几十万点。只有独立成行，
+      才能做到「只取勾选的曲线」：``curves=`` 过滤能下推到 SQL
+      （只加载命中的 ``Curve.series``），``meta_only`` 也能只读元信息、
+      完全不碰 series。
+    * ``point_count`` 冗余存储，负载估算时不用解析 series。
+
+    ``group`` 沿用 ``'cal'``（计算曲线）/ ``'duiqi'``（对齐曲线），
+    前端按组展示；新格式可以新增 group 取值，不需要改表。
+    """
+
+    __tablename__ = "curves"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    dataset_id: Mapped[int] = mapped_column(
+        ForeignKey("datasets.id", ondelete="CASCADE"),
+    )
+    group: Mapped[str] = mapped_column(String(20), index=True)         # 'cal' | 'duiqi'
+    name: Mapped[str] = mapped_column(String(200))                     # '方向盘转角-时间'
+    title: Mapped[Optional[str]] = mapped_column(String(200))
+    xlabel: Mapped[Optional[str]] = mapped_column(String(100))
+    ylabel: Mapped[Optional[str]] = mapped_column(String(200))
+    series: Mapped[List] = mapped_column(JSONType)                     # [{x,y,curvetype,curvename}, …]
+    point_count: Mapped[Optional[int]] = mapped_column(Integer)        # 采样点数（冗余）
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(server_default=func.now())
+
+    dataset: Mapped["Dataset"] = relationship(back_populates="curves")
+
+    __table_args__ = (
+        Index("ix_curves_dataset_group", "dataset_id", "group", "sort_order"),
     )
