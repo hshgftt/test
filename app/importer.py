@@ -1,31 +1,26 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-数据导入：**解析**（JSON / msgpack / CSV 元信息）+ **写库**。
+"""数据导入：解析（JSON / msgpack / CSV）与写库。
 
-为什么单独成模块
-================
+目录约定
+========
 
-导入规则原本内联在 ``scripts/import_data.py`` 的 ``main()`` 里，只有命令行能用。
-上传页面（``POST /api/upload``）需要**同一套**规则 —— 否则「命令行导入」和
-「页面导入」会慢慢长出两套行为（平均实验怎么识别、``raw_key`` 怎么拆、
-CSV 用哪一列关联车型），早晚对不上，而且对不上时很难发现。
+::
 
-所以这里只放纯逻辑，命令行和 HTTP 接口都调它，**规则只有一份**。
+    <root>/
+      vehicles.csv                # 可选，任意列：车名 + 任意车辆字段
+      conditions.csv              # 可选，name,category,description
+      <车名>/
+        <工况>.json               # 无模式
+        <模式>/<工况>.json        # 有模式（舒适 / 运动 / …）
 
-数据目录约定
-============
-
-    <root>/<车型>/<工况>.<后缀>
-    <root>/vehicles.csv      （可选）
-    <root>/conditions.csv    （可选）
-
-后缀认 ``.json`` / ``.msgpack`` / ``.msg`` / ``.mpack``，后缀决定读法，
-内容结构完全一致。
-
-上传场景下 ``<root>`` 这一层是**浏览器的文件夹选择器**带来的（webkitRelativePath
-的第一个片段），前端会剥掉；这里再用 :func:`strip_common_root` 兜一次底，
-避免用户直接选到「data」这一层时车型名变成 ``data``。
+* 中间目录就是试验模式（可以多层，按 ``/`` 拼接）。模式属于试验侧，
+  每台车有几种完全由目录决定。
+* 车名全局唯一。文件夹名可以带单号：``极光EV-01(CS-2024-001)``，
+  括号里的内容会记为操稳单号；CSV 也可以写 ``操稳单号`` / ``平顺单号``，
+  多个单号用 ``;``、``,``、``|``、``、`` 分隔。
+* 车辆字段不写死。``vehicles.csv`` 的表头按 ``attr_defs.code`` 或
+  ``attr_defs.name`` 匹配；匹配不到的列会**自动注册成新字段**，不需要改表。
+* 数据格式不写死。已知格式（指标 + 曲线）解析成
+  ``datasets / metric_values / curves``；其它格式整块放进 ``datasets.payload``。
 """
 from __future__ import annotations
 
@@ -35,19 +30,23 @@ import json
 import os
 import re
 import time
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
-from sqlalchemy.orm import joinedload
+from sqlalchemy import delete, select
 
+from app import crud
 from app.database import Base, SessionLocal, engine
+from app.metadata import seed_metadata
 from app.models import (
-    Brand,
+    AttrDef,
     Condition,
     Curve,
-    Experiment,
-    Indicator,
-    Platform,
+    Dataset,
+    DatasetType,
+    MetricValue,
+    TestOrder,
     Vehicle,
+    VehicleMode,
 )
 
 AVG_KEYS = {"平均", "avg", "average", "AVE", "AVE."}
@@ -57,8 +56,6 @@ MSGPACK_EXTS = (".msgpack", ".msg", ".mpack")
 JSON_EXTS = (".json",)
 READABLE_EXTS: Tuple[str, ...] = JSON_EXTS + MSGPACK_EXTS
 
-# 元信息 CSV 的文件名（不区分大小写）。用户手写的中文名也认，
-# 免得因为叫「车辆信息.csv」就静默地拿不到品牌/平台。
 VEHICLES_CSV_NAMES = {
     "vehicles.csv", "vehicle.csv", "车辆信息.csv", "车型信息.csv", "车型.csv",
 }
@@ -66,16 +63,31 @@ CONDITIONS_CSV_NAMES = {
     "conditions.csv", "condition.csv", "工况信息.csv", "工况.csv",
 }
 
+# CSV 里不是「车辆属性」的列
+NAME_COLUMNS = ("车名", "车型", "车辆名称", "名称", "vehicle", "name", "vehicle_name")
+MODE_COLUMNS = ("模式", "试验模式", "车辆模式", "modes", "test_modes", "mode")
+ORDER_COLUMNS = {
+    "操稳": ("操稳单号", "操稳单", "handling_order", "handling_order_no",
+             "test_order", "test_order_no", "单号"),
+    "平顺": ("平顺单号", "平顺单", "ride_order", "ride_order_no"),
+}
+
+# 旧 CSV 表头 → 默认字段 code（默认字段的 name 与表头不一致时用）
+HEADER_ALIASES = {
+    "驱动方式": "drive_type",
+    "车架号": "vin",
+    "年款": "model_year",
+}
+
+DEFAULT_DATASET_TYPE = "handling_stability"
+
 
 # ═══════════════════════════════════════════════════════════════════════
-# 文件读取：JSON / msgpack
+# 文件读取
 # ═══════════════════════════════════════════════════════════════════════
 
 def _decode_msgpack_keys(obj: Any) -> Any:
-    """把 msgpack 里可能残留的 bytes key/value 转成 str。
-
-    float 数组原样保留 —— 曲线点动辄几十万个，逐个转换会显著拖慢导入。
-    """
+    """把 msgpack 里可能残留的 bytes key/value 转成 str（float 数组原样保留）。"""
     if isinstance(obj, dict):
         out: Dict[Any, Any] = {}
         for k, v in obj.items():
@@ -108,24 +120,16 @@ def _msgpack_lib():
 
 
 def load_msgpack_bytes(raw: bytes) -> Any:
-    """读 msgpack 字节流。
-
-    msgpack 的 str/bytes 语义在 0.5→1.0 之间变过：老版本 dump 出来的
-    中文 key 可能是 bytes。这里走 ``raw=False`` 再做一次兜底解码，
-    避免出现 ``b'\\xe8\\xa7\\x92...'`` 这种 key 导致指标名全乱。
-    """
     mp = _msgpack_lib()
     data = mp.unpackb(raw, raw=False, strict_map_key=False)
     return _decode_msgpack_keys(data)
 
 
 def _looks_like_msgpack(raw: bytes) -> bool:
-    """msgpack 的 map/array 首字节落在 0x80-0x9F（fixmap/fixarray）、0xDC-0xDF。"""
     return bool(raw) and (0x80 <= raw[0] <= 0x9F or 0xDC <= raw[0] <= 0xDF)
 
 
 def load_data_bytes(raw: bytes, filename: str = "") -> Any:
-    """按后缀（认不出就按内容嗅探）解析一份数据文件，返回 Python 对象。"""
     lower = (filename or "").lower()
     if lower.endswith(MSGPACK_EXTS):
         return load_msgpack_bytes(raw)
@@ -137,22 +141,17 @@ def load_data_bytes(raw: bytes, filename: str = "") -> Any:
 
 
 def load_data_file(path: str) -> Any:
-    """按后缀读取磁盘上的数据文件（JSON / msgpack）。"""
     with open(path, "rb") as fh:
         raw = fh.read()
     return load_data_bytes(raw, path)
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# raw_key 解析（与 seed_data.parse_raw_key 保持同一套语义）
+# raw_key 解析
 # ═══════════════════════════════════════════════════════════════════════
 
 def parse_raw_key(raw_key: str) -> Tuple[Optional[int], str, Optional[str]]:
-    """raw_key → (数字前缀 or None, name, unit or None)。
-
-    参数/曲线名都可能是 ``'13-侧向加速度稳态值(g)'`` / ``'侧向加速度稳态值(g)'``
-    / ``'侧向加速度稳态值'`` 三种形态。数字前缀只用于排序，不入库。
-    """
+    """raw_key → (数字前缀 or None, name, unit or None)。数字前缀只用于排序。"""
     seq: Optional[int] = None
     body = raw_key
     m = re.match(r"^\s*(\d+)\s*[-._、]\s*(.+)$", raw_key)
@@ -173,7 +172,6 @@ def is_average_key(k: str) -> bool:
 
 
 def exp_sort_key(k: str) -> Tuple[int, float, str]:
-    """排序：数字实验在前（按数值），平均最后。"""
     if is_average_key(k):
         return (1, 0.0, k)
     m = re.match(r"^\s*(\d+)\s*$", str(k))
@@ -183,18 +181,16 @@ def exp_sort_key(k: str) -> Tuple[int, float, str]:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 单份数据的解析
+# 单份数据解析
 # ═══════════════════════════════════════════════════════════════════════
 
 def looks_like_params(d: Any) -> bool:
-    """指标 dict：值都是标量（数字 / 字符串 / None）。"""
     if not isinstance(d, dict) or not d:
         return False
     return all(not isinstance(v, dict) for v in d.values())
 
 
 def looks_like_curves(d: Any) -> bool:
-    """曲线 dict：值是 dict 且含 curve/curves/series。"""
     if not isinstance(d, dict) or not d:
         return False
     for v in d.values():
@@ -204,7 +200,7 @@ def looks_like_curves(d: Any) -> bool:
 
 
 def normalize_curves(raw: Any) -> Dict[str, dict]:
-    """把各家的曲线写法统一成 ``{name: {curve: [...], title, xlabel, ylabel}}``。"""
+    """把各家曲线写法统一成 ``{name: {curve: [...], title, xlabel, ylabel}}``。"""
     out: Dict[str, dict] = {}
     if not isinstance(raw, dict):
         return out
@@ -217,7 +213,6 @@ def normalize_curves(raw: Any) -> Dict[str, dict]:
                 series = cval[g]
                 break
         if series is None:
-            # 可能直接就是 {"x": [...], "y": [...]} 的单条线
             if "x" in cval and "y" in cval:
                 series = [cval]
             else:
@@ -232,7 +227,6 @@ def normalize_curves(raw: Any) -> Dict[str, dict]:
                 "x": s.get("x") or [],
                 "y": s.get("y") or [],
                 "curvetype": s.get("curvetype") or "line",
-                # 没有 curvename 时给个稳定的兜底名，前端按原样展示
                 "curvename": s.get("curvename") or ("series%d" % i),
             })
         if not norm:
@@ -247,22 +241,45 @@ def normalize_curves(raw: Any) -> Dict[str, dict]:
     return out
 
 
+def _curve_groups(arr: List[Any]) -> Dict[str, Dict[str, dict]]:
+    """``[params, curves_cal, curves_duiqi, …]`` → ``{cal: …, duiqi: …}``.
+
+    位置 1 固定是 ``cal``、位置 2 固定是 ``duiqi``；再往后的位置用
+    ``group3`` / ``group4`` 命名，保证新格式可以带更多曲线组而不改这里。
+    """
+    groups: Dict[str, Dict[str, dict]] = {}
+    names = ("cal", "duiqi")
+    for i, blob in enumerate(arr[1:]):
+        if not isinstance(blob, dict):
+            continue
+        name = names[i] if i < len(names) else "group%d" % (i + 1)
+        groups[name] = normalize_curves(blob)
+    return groups
+
+
 def parse_payload(obj: Any) -> Dict[str, Dict[str, Any]]:
-    """把一份数据规范化成 ``{实验号: {params, curves_cal, curves_duiqi}}``。
+    """规范化成 ``{实验号: {"params": {...}, "curves": {group: {...}}}}``。
 
-    支持两种写法：
+    支持：
 
-    * **A（推荐）** 顶层 key = 实验号 → ``{exp_no: [params, cal, duiqi]}``
-    * **B（扁平）** 顶层直接是 params → ``{params, curves_cal, curves_duiqi}``
-      （等价于单次实验，实验号记作 ``'1'``）
+    * **A（推荐）** ``{exp_no: [params, cal, duiqi]}``
+    * **B（扁平）** ``{"params": {...}, "curves_cal": {...}, "curves_duiqi": {...}}``
+    * **C（按组命名）** ``{exp_no: {"params": …, "curves_cal": …}}``
     """
     result: Dict[str, Dict[str, Any]] = {}
 
     if isinstance(obj, dict) and isinstance(obj.get("params"), (dict, list)):
+        groups: Dict[str, Dict[str, dict]] = {}
+        for key, val in obj.items():
+            if key == "params":
+                continue
+            if key == "curves":
+                groups["cal"] = normalize_curves(val)
+            elif str(key).startswith("curves_"):
+                groups[str(key)[len("curves_"):]] = normalize_curves(val)
         result["1"] = {
-            "params": obj.get("params") or {},
-            "curves_cal": normalize_curves(obj.get("curves_cal")),
-            "curves_duiqi": normalize_curves(obj.get("curves_duiqi")),
+            "params": obj.get("params") if isinstance(obj.get("params"), dict) else {},
+            "curves": groups,
         }
         return result
 
@@ -272,34 +289,41 @@ def parse_payload(obj: Any) -> Dict[str, Dict[str, Any]]:
     for exp_no, arr in obj.items():
         if isinstance(arr, list):
             params = arr[0] if len(arr) > 0 and isinstance(arr[0], dict) else {}
-            cal = arr[1] if len(arr) > 1 else {}
-            dui = arr[2] if len(arr) > 2 else {}
+            groups = _curve_groups(arr)
         elif isinstance(arr, dict):
             params = arr.get("params") or {}
-            cal = arr.get("curves_cal") or {}
-            dui = arr.get("curves_duiqi") or {}
+            groups = {}
+            for key, val in arr.items():
+                if key == "params":
+                    continue
+                if key == "curves":
+                    groups["cal"] = normalize_curves(val)
+                elif str(key).startswith("curves_"):
+                    groups[str(key)[len("curves_"):]] = normalize_curves(val)
         else:
             continue
-        # 容错：有人把 params 和 curves 混在一个 dict 里
+
+        # 容错：有人把曲线混进 params
         if isinstance(params, dict):
-            extra_cal = {k: v for k, v in params.items() if looks_like_curves({k: v})}
-            if extra_cal:
-                cal = {**extra_cal, **(cal or {})}
-                params = {k: v for k, v in params.items() if k not in extra_cal}
+            extra = {k: v for k, v in params.items() if looks_like_curves({k: v})}
+            if extra:
+                cal = dict(groups.get("cal") or {})
+                cal.update(normalize_curves(extra))
+                groups["cal"] = cal
+                params = {k: v for k, v in params.items() if k not in extra}
+
         result[str(exp_no)] = {
             "params": params if isinstance(params, dict) else {},
-            "curves_cal": normalize_curves(cal),
-            "curves_duiqi": normalize_curves(dui),
+            "curves": groups,
         }
     return result
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 元信息 CSV
+# CSV
 # ═══════════════════════════════════════════════════════════════════════
 
 def _csv_rows(src: Any) -> List[Dict[str, str]]:
-    """读 CSV。``src`` 可以是路径、bytes，或 CSV 文本本身。"""
     if src is None:
         return []
     if isinstance(src, (bytes, bytearray)):
@@ -314,31 +338,53 @@ def _csv_rows(src: Any) -> List[Dict[str, str]]:
     return [r for r in csv.DictReader(io.StringIO(text))]
 
 
+def _split_multi(value: str) -> List[str]:
+    return [x.strip() for x in re.split(r"[;,|、，]", value or "") if x.strip()]
+
+
+def _pick(row: Dict[str, str], names: Iterable[str]) -> str:
+    lower = {str(k).strip().lower(): (v or "").strip() for k, v in row.items()}
+    for n in names:
+        v = lower.get(n.lower(), "")
+        if v:
+            return v
+    return ""
+
+
 def read_vehicles_csv(src: Any) -> Dict[str, Dict[str, Any]]:
-    """vehicles.csv → ``{车型名: {platform, brand, drive_type, vin, model_year}}``"""
+    """vehicles.csv → ``{车名: {"attrs": {表头: 值}, "modes": [...], "orders": [...]}}``.
+
+    表头不在这里解释，写库时才按 ``attr_defs`` 映射；匹配不到的列会自动
+    注册成新字段。
+    """
     out: Dict[str, Dict[str, Any]] = {}
     for row in _csv_rows(src):
-        def pick(*names: str) -> str:
-            for n in names:
-                v = (row.get(n) or "").strip()
-                if v:
-                    return v
-            return ""
-        name = pick("车型", "车型名", "vehicle", "name")
+        name = _pick(row, NAME_COLUMNS)
         if not name:
             continue
-        out[name] = {
-            "platform": pick("平台", "platform") or "默认平台",
-            "brand": pick("品牌", "brand") or "默认品牌",
-            "drive_type": pick("驱动方式", "驱动", "drive_type") or None,
-            "vin": pick("车架号", "vin") or None,
-            "model_year": pick("年款", "model_year") or None,
+
+        modes = _split_multi(_pick(row, MODE_COLUMNS))
+        orders: List[Dict[str, str]] = []
+        for discipline, cols in ORDER_COLUMNS.items():
+            for no in _split_multi(_pick(row, cols)):
+                orders.append({"discipline": discipline, "order_no": no})
+
+        skip = {n.lower() for n in NAME_COLUMNS}
+        skip.update(n.lower() for n in MODE_COLUMNS)
+        for cols in ORDER_COLUMNS.values():
+            skip.update(n.lower() for n in cols)
+
+        attrs = {
+            str(k).strip(): (v or "").strip()
+            for k, v in row.items()
+            if k and str(k).strip() and str(k).strip().lower() not in skip
+            and (v or "").strip()
         }
+        out[name] = {"attrs": attrs, "modes": modes, "orders": orders}
     return out
 
 
 def read_conditions_csv(src: Any) -> Dict[str, Dict[str, Optional[str]]]:
-    """conditions.csv → ``{工况名: {category, description}}``"""
     out: Dict[str, Dict[str, Optional[str]]] = {}
     for row in _csv_rows(src):
         name = (row.get("name") or row.get("工况") or "").strip()
@@ -351,41 +397,17 @@ def read_conditions_csv(src: Any) -> Dict[str, Dict[str, Optional[str]]]:
     return out
 
 
-def infer_vehicle(name: str, meta: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """没有 CSV 时按车型名兜底推断品牌（``'极光EV-01'`` → 品牌 ``'极光'``）。
-
-    **数据文件里没有任何车辆属性**（算法侧不产出平台/品牌/驱动方式），
-    所以 CSV 是唯一的来源；缺了就只能猜。
-    """
-    if name in meta:
-        m = dict(meta[name])
-    else:
-        m = {"platform": "默认平台", "brand": "默认品牌",
-             "drive_type": None, "vin": None, "model_year": None}
-        mm = re.match(r"^([A-Za-z\u4e00-\u9fff]{2,6})", name)
-        if mm:
-            m["brand"] = mm.group(1)
-    if m.get("model_year"):
-        try:
-            m["model_year"] = int(str(m["model_year"])[:4])
-        except ValueError:
-            m["model_year"] = None
-    return m
-
-
 # ═══════════════════════════════════════════════════════════════════════
-# 扫描：路径列表 → 待导入条目
+# 扫描
 # ═══════════════════════════════════════════════════════════════════════
 
 def normalize_relpath(p: str) -> str:
-    """统一分隔符、去掉 ``./`` 与首尾斜杠，防止 ``a\\b`` 与 ``a/b`` 变成两台车。"""
     s = str(p or "").replace("\\", "/")
     s = re.sub(r"^\./+", "", s.strip())
     return s.strip("/")
 
 
 def strip_ext(filename: str, exts: Tuple[str, ...] = READABLE_EXTS) -> str:
-    """去掉数据后缀（``'角阶跃.msgpack'`` → ``'角阶跃'``）。"""
     lower = filename.lower()
     for ext in exts:
         if lower.endswith(ext):
@@ -399,24 +421,7 @@ def _is_meta_csv(basename: str) -> bool:
 
 
 def strip_common_root(rels: List[str]) -> List[str]:
-    """剥掉最外层那个「包裹文件夹」。
-
-    浏览器用 ``webkitdirectory`` 选文件夹时，``webkitRelativePath`` 会把
-    被选中的那一层也带上（``data/极光EV-1/角阶跃.json``）。前端会先剥一次，
-    这里再兜一次底，因为**前端剥错时症状很隐蔽**：车型名会变成 ``data``，
-    数据照样入库，只是目录树里多一层奇怪的「车型」—— 更糟的是
-    ``data/示例车A/角阶跃.json`` 和 ``data/示例车B/角阶跃.json`` 会撞成
-    同一台车，然后因为实验号重复直接 IntegrityError。
-
-    怎么判断该剥几层：
-
-    1. **有元信息 CSV 时以 CSV 为准** —— CSV 是放在数据根目录的，它所在的
-       目录就是根。这条最可靠，因为 CSV 的位置是数据提供方自己定的。
-    2. 没有 CSV 时，如果所有文件都至少有 3 层，那多出来的一层只能是包裹目录。
-
-    注意**不能无条件剥**：用户直接把一台车的文件夹拖进来时，
-    ``极光EV-1/角阶跃.json`` 里的 ``极光EV-1`` 就是车型名，剥了就没了。
-    """
+    """剥掉最外层包裹目录（浏览器选择文件夹时会带上被选中的那一层）。"""
     if not rels:
         return rels
     parts = [r.split("/") for r in rels]
@@ -431,26 +436,34 @@ def strip_common_root(rels: List[str]) -> List[str]:
 
     if root <= 0:
         return rels
-    # 比 root 还浅的（比如裹目录里的 README.txt）原样留着，
-    # 让它走正常的「后缀不认识 → skipped」通道，不要静默丢掉。
     return ["/".join(p[root:]) if len(p) > root else "/".join(p) for p in parts]
 
 
 def prepare_paths(rels: Iterable[str]) -> List[str]:
-    """规范化相对路径 + 剥掉包裹目录。**只调用一次**（重复剥会少一层）。"""
     return strip_common_root([normalize_relpath(p) for p in rels])
 
 
-class ItemBuilder:
-    """边收边解析的累加器。
+def split_vehicle_folder(folder: str) -> Tuple[str, Optional[str]]:
+    """``极光EV-01(CS-2024-001)`` → ``("极光EV-01", "CS-2024-001")``。
 
-    为什么不「先把所有原始字节收齐再解析」：上传几十份曲线文件时，
-    原始 JSON 文本和解析出来的对象会**同时**驻留内存，峰值直接翻倍。
-    这里每份文件解析完就把 ``raw`` 丢掉，峰值只跟解析后的数据有关。
+    只认结尾的整对括号；没有括号就原样返回。
     """
+    m = re.match(r"^(.*?)\s*[（(]\s*([^()（）]+?)\s*[）)]\s*$", folder)
+    if m and m.group(1).strip():
+        return m.group(1).strip(), m.group(2).strip()
+    return folder.strip(), None
 
-    def __init__(self, exts: Tuple[str, ...] = READABLE_EXTS) -> None:
+
+class ItemBuilder:
+    """边收边解析的累加器。"""
+
+    def __init__(
+        self,
+        exts: Tuple[str, ...] = READABLE_EXTS,
+        dataset_type: str = DEFAULT_DATASET_TYPE,
+    ) -> None:
         self.exts = tuple(e.lower() for e in exts)
+        self.dataset_type = dataset_type or DEFAULT_DATASET_TYPE
         self.items: List[Dict[str, Any]] = []
         self.errors: List[Dict[str, str]] = []
         self.skipped: List[str] = []
@@ -460,7 +473,6 @@ class ItemBuilder:
         self.conditions_csv: Optional[str] = None
 
     def add(self, relpath: str, raw: bytes) -> None:
-        """收一份文件。``relpath`` 必须是已经 :func:`prepare_paths` 过的。"""
         rel = relpath
         if not rel:
             return
@@ -483,10 +495,12 @@ class ItemBuilder:
         if len(parts) < 2:
             self.errors.append({
                 "file": rel,
-                "error": "缺少车型文件夹：目录结构应为 <车型>/<工况>.<后缀>",
+                "error": "缺少车名文件夹：目录结构应为 <车名>/[<模式>/]<工况>.<后缀>",
             })
             return
-        vehicle = parts[0]
+
+        folder, folder_order = split_vehicle_folder(parts[0])
+        mode = "/".join(parts[1:-1]) or None
         condition = strip_ext(base, self.exts)
 
         try:
@@ -497,17 +511,26 @@ class ItemBuilder:
                 "error": "解析失败: %s: %s" % (type(e).__name__, e),
             })
             return
-        payload = parse_payload(obj)
-        if not payload:
-            self.errors.append({
-                "file": rel, "error": "结构无法识别（既不是 params 也不是曲线）",
-            })
-            return
+
+        experiments = parse_payload(obj) if self.dataset_type == DEFAULT_DATASET_TYPE else {}
+        if experiments:
+            kind = "experiments"
+            payload = None
+        else:
+            # 未知格式：整块兜底进 datasets.payload，不丢数据
+            kind = "payload"
+            experiments = {}
+            payload = obj
 
         self.items.append({
-            "vehicle": vehicle,
+            "vehicle": folder,
+            "folder_order": folder_order,
+            "mode": mode,
             "condition": condition,
             "file": rel,
+            "dataset_type": self.dataset_type,
+            "kind": kind,
+            "experiments": experiments,
             "payload": payload,
         })
 
@@ -526,15 +549,11 @@ class ItemBuilder:
 def build_items(
     entries: Iterable[Tuple[str, bytes]],
     exts: Tuple[str, ...] = READABLE_EXTS,
+    dataset_type: str = DEFAULT_DATASET_TYPE,
 ) -> Dict[str, Any]:
-    """``[(相对路径, 字节)]`` → 待导入条目 + 元信息 + 错误清单。
-
-    命令行 / 测试用的一次性接口；上传接口走 :class:`ItemBuilder`，
-    因为那边每份文件是分开读进来的。
-    """
     pairs = list(entries)
     rels = prepare_paths([p for p, _ in pairs])
-    b = ItemBuilder(exts)
+    b = ItemBuilder(exts, dataset_type=dataset_type)
     for rel, (_, raw) in zip(rels, pairs):
         b.add(rel, raw)
     return b.result()
@@ -543,23 +562,18 @@ def build_items(
 def scan_dir(
     data_dir: str,
     exts: Tuple[str, ...] = READABLE_EXTS,
+    dataset_type: str = DEFAULT_DATASET_TYPE,
 ) -> Dict[str, Any]:
-    """扫描磁盘目录，返回与 :func:`build_items` 相同的结构。"""
     if not os.path.isdir(data_dir):
         raise SystemExit("数据目录不存在: %s" % data_dir)
 
     entries: List[Tuple[str, bytes]] = []
-    for entry in sorted(os.listdir(data_dir)):
-        vdir = os.path.join(data_dir, entry)
-        if not os.path.isdir(vdir):
-            if os.path.isfile(vdir):
-                entries.append((entry, _read_bytes(vdir)))
-            continue
-        for fn in sorted(os.listdir(vdir)):
-            fpath = os.path.join(vdir, fn)
-            if os.path.isfile(fpath):
-                entries.append(("%s/%s" % (entry, fn), _read_bytes(fpath)))
-    return build_items(entries, exts=exts)
+    for root, _dirs, files in os.walk(data_dir):
+        for fn in sorted(files):
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, data_dir).replace("\\", "/")
+            entries.append((rel, _read_bytes(full)))
+    return build_items(entries, exts=exts, dataset_type=dataset_type)
 
 
 def _read_bytes(path: str) -> bytes:
@@ -572,47 +586,60 @@ def _read_bytes(path: str) -> bytes:
 # ═══════════════════════════════════════════════════════════════════════
 
 def summarize(items: List[Dict[str, Any]], vmeta: Optional[Dict] = None) -> Dict[str, Any]:
-    """把条目汇总成一份「将写入什么」的清单（dry-run 与上传预览共用）。"""
-    vehicles = sorted({it["vehicle"] for it in items})
-    conditions = sorted({it["condition"] for it in items})
-    n_exp = n_ind = n_cur = n_pts = 0
+    vehicles: Set[str] = set()
+    conditions: Set[str] = set()
+    modes: Set[str] = set()
+    types: Set[str] = set()
+    n_ds = n_ind = n_cur = n_pts = 0
+
     for it in items:
-        for blob in it["payload"].values():
-            n_exp += 1
+        vehicles.add(it["vehicle"])
+        conditions.add(it["condition"])
+        types.add(it.get("dataset_type") or DEFAULT_DATASET_TYPE)
+        if it.get("mode"):
+            modes.add(it["mode"])
+        if it["kind"] == "payload":
+            n_ds += 1
+            continue
+        for blob in it["experiments"].values():
+            n_ds += 1
             n_ind += len(blob.get("params") or {})
-            for cdict in (blob.get("curves_cal"), blob.get("curves_duiqi")):
+            for cdict in (blob.get("curves") or {}).values():
                 for cval in (cdict or {}).values():
                     n_cur += 1
                     ser = cval.get("curve") or []
                     n_pts += len(ser[0].get("x", [])) if ser else 0
+
     return {
         "files": len(items),
         "vehicles": len(vehicles),
         "conditions": len(conditions),
-        "experiments": n_exp,
+        "modes": len(modes),
+        "dataset_types": len(types),
+        "datasets": n_ds,
         "indicators": n_ind,
         "curves": n_cur,
         "points": n_pts,
-        "vehicle_names": vehicles,
-        "condition_names": conditions,
+        "vehicle_names": sorted(vehicles),
+        "condition_names": sorted(conditions),
+        "mode_names": sorted(modes),
         "meta_vehicles": len(vmeta or {}),
     }
 
 
 def preview_text(items: List[Dict[str, Any]], meta: Dict[str, Any]) -> str:
-    """命令行 dry-run 用的可读摘要。"""
     s = summarize(items, meta.get("vmeta"))
     lines = [
-        "  车型 %d 台 / 工况 %d 个 / 车×工况文件 %d 份"
-        % (s["vehicles"], s["conditions"], s["files"]),
-        "  将写入：实验 %d 次 / 指标 %d 行 / 曲线 %d 条（%s 个采样点）"
-        % (s["experiments"], s["indicators"], s["curves"], _fmt_int(s["points"])),
+        "  车辆 %d 台 / 模式 %d 种 / 工况 %d 个 / 文件 %d 份"
+        % (s["vehicles"], s["modes"], s["conditions"], s["files"]),
+        "  将写入：数据集 %d 条 / 指标 %d 行 / 曲线 %d 条（%s 个采样点）"
+        % (s["datasets"], s["indicators"], s["curves"], _fmt_int(s["points"])),
     ]
     if s["meta_vehicles"]:
         lines.append("  车辆元信息来自: %s（%d 台）"
                      % (meta.get("vehicles_csv"), s["meta_vehicles"]))
     else:
-        lines.append("  ! 未找到 vehicles.csv，品牌将按车型名前缀推断")
+        lines.append("  ! 未找到 vehicles.csv，车辆属性将为空（车名仍按文件夹写入）")
     return "\n".join(lines)
 
 
@@ -625,13 +652,128 @@ def _fmt_int(n: int) -> str:
 # ═══════════════════════════════════════════════════════════════════════
 
 def reset_schema() -> None:
-    """清空所有表（导入前用）。"""
+    """清空所有表并写入默认元数据。"""
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        seed_metadata(db)
+    finally:
+        db.close()
 
 
 def ensure_schema() -> None:
     Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        seed_metadata(db)
+    finally:
+        db.close()
+
+
+def _code_for(name: str) -> str:
+    candidate = re.sub(r"[^a-zA-Z0-9_]+", "_", name).strip("_").lower()
+    if candidate:
+        return candidate[:50]
+    import hashlib
+    return "f_" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+
+
+def _attr_lookup(db) -> Tuple[Dict[str, AttrDef], Dict[str, AttrDef]]:
+    attrs = list(db.execute(select(AttrDef)).scalars())
+    by_code = {a.code: a for a in attrs}
+    by_name = {a.name.strip().lower(): a for a in attrs}
+    return by_code, by_name
+
+
+def _register_attr(db, header: str, values: Sequence[str],
+                   by_code: Dict[str, AttrDef], by_name: Dict[str, AttrDef]) -> AttrDef:
+    """把 CSV 表头映射到字段；匹配不到就自动注册一个新字段。"""
+    key = header.strip()
+    alias = HEADER_ALIASES.get(key)
+    if alias and alias in by_code:
+        return by_code[alias]
+    if key in by_code:
+        return by_code[key]
+    if key.lower() in by_name:
+        return by_name[key.lower()]
+
+    value_type = "text"
+    nums = [_parse_float(v) for v in values if v not in (None, "")]
+    if nums and all(n is not None for n in nums):
+        value_type = "number"
+
+    code = _code_for(key)
+    base = code
+    i = 2
+    while code in by_code:
+        code = "%s_%d" % (base, i)
+        i += 1
+
+    attr = AttrDef(
+        code=code, name=key, value_type=value_type,
+        sort_order=1000 + len(by_code), show_in_list=True, is_active=True,
+    )
+    db.add(attr)
+    db.flush()
+    by_code[code] = attr
+    by_name[key.lower()] = attr
+    return attr
+
+
+def _parse_float(value: Any) -> Optional[float]:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ensure_vehicle_modes(db, vehicle: Vehicle, modes: Iterable[str]) -> Dict[str, int]:
+    existing = {
+        m.mode: m for m in db.execute(
+            select(VehicleMode).where(VehicleMode.vehicle_id == vehicle.id)
+        ).scalars()
+    }
+    out = {name: obj.id for name, obj in existing.items() if obj.id is not None}
+    order = len(existing)
+    for raw in modes:
+        name = str(raw).strip()
+        if not name or name in existing:
+            continue
+        obj = VehicleMode(vehicle_id=vehicle.id, mode=name, sort_order=order)
+        db.add(obj)
+        db.flush()
+        existing[name] = obj
+        out[name] = obj.id
+        order += 1
+    return out
+
+
+def _ensure_test_orders(
+    db, vehicle: Vehicle, orders: Iterable[Dict[str, str]],
+) -> Dict[Tuple[str, str], int]:
+    existing = {
+        (o.discipline, o.order_no): o for o in db.execute(
+            select(TestOrder).where(TestOrder.vehicle_id == vehicle.id)
+        ).scalars()
+    }
+    out = {
+        key: obj.id for key, obj in existing.items() if obj.id is not None
+    }
+    for item in orders:
+        discipline = str(item.get("discipline") or "操稳").strip()
+        no = str(item.get("order_no") or "").strip()
+        key = (discipline, no)
+        if not no or key in existing:
+            continue
+        obj = TestOrder(vehicle_id=vehicle.id, discipline=discipline, order_no=no)
+        db.add(obj)
+        db.flush()
+        existing[key] = obj
+        out[key] = obj.id
+    return out
 
 
 def import_items(
@@ -644,146 +786,182 @@ def import_items(
     progress: Optional[Callable[[int, int], None]] = None,
     batch: int = 10,
 ) -> Dict[str, Any]:
-    """把 :func:`build_items` 的产物写进库。
+    """把解析结果写进库。
 
-    ``append=False``（默认）假定表已经清空过（:func:`reset_schema`）。
-
-    ``append=True`` 是**按「车 × 工况」覆盖**，不是简单追加：
-    同一个 (车型, 工况) 再导一次，会先删掉它原有的实验再写新的。
-    理由 —— ``experiments`` 上有 ``uq_exp_vehicle_condition_no`` 唯一约束，
-    简单追加遇到同一实验号会直接 IntegrityError；而且「重新上传一次同一份
-    数据」本来就应该是覆盖语义，不该报错。层级（平台/品牌/车型/工况）
-    也复用已有的，不重复插。
+    ``append=False`` 假定表刚重建过；``append=True`` 时按
+    「车 × 模式 × 工况 × 数据格式 × 文件」覆盖，不会重复插入。
     """
     vmeta = vmeta or {}
     cmeta = cmeta or {}
     t0 = time.time()
 
-    plat_cache: Dict[str, Platform] = {}
-    brand_cache: Dict[Tuple[str, str], Brand] = {}
-    veh_cache: Dict[Tuple[str, str], Vehicle] = {}
-    cond_cache: Dict[str, Condition] = {}
+    seed_metadata(db)
+    by_code, by_name = _attr_lookup(db)
 
-    if append:
-        for p in db.query(Platform).all():
-            plat_cache[p.name] = p
-        for b in db.query(Brand).options(joinedload(Brand.platform)).all():
-            brand_cache[(b.platform.name, b.name)] = b
-        for v in db.query(Vehicle).options(joinedload(Vehicle.brand)).all():
-            veh_cache[(v.name, v.brand.name)] = v
-        for c in db.query(Condition).all():
-            cond_cache[c.name] = c
+    # ── 自动注册 CSV 里出现的新字段 ──
+    headers: Dict[str, List[str]] = {}
+    for meta in vmeta.values():
+        for header, value in (meta.get("attrs") or {}).items():
+            headers.setdefault(header, []).append(value)
+    header_codes: Dict[str, str] = {}
+    for header, values in headers.items():
+        attr = _register_attr(db, header, values, by_code, by_name)
+        header_codes[header] = attr.code
+    db.flush()
 
     # ── 工况 ──
+    cond_cache: Dict[str, Condition] = {
+        c.name: c for c in db.execute(select(Condition)).scalars()
+    }
     for cname in sorted({it["condition"] for it in items}):
         cm = cmeta.get(cname, {})
         cond = cond_cache.get(cname)
         if cond is None:
             cond = Condition(name=cname)
             db.add(cond)
+            db.flush()
             cond_cache[cname] = cond
-        # CSV 给了分类/说明就补上（append 时也允许补齐）
         if cm.get("category"):
             cond.category = cm["category"]
         if cm.get("description"):
             cond.description = cm["description"]
-    db.flush()
 
-    # ── 平台 / 品牌 / 车型 ──
-    vbrand: Dict[str, str] = {}
-    for vname in sorted({it["vehicle"] for it in items}):
-        m = infer_vehicle(vname, vmeta)
-        pname, bname = m["platform"], m["brand"]
-        vbrand[vname] = bname
-
-        plat = plat_cache.get(pname)
-        if plat is None:
-            plat = Platform(name=pname)
-            db.add(plat)
+    # ── 数据格式 ──
+    type_codes = sorted({it.get("dataset_type") or DEFAULT_DATASET_TYPE for it in items})
+    type_cache: Dict[str, DatasetType] = {
+        t.code: t for t in db.execute(select(DatasetType)).scalars()
+    }
+    for code in type_codes:
+        if code not in type_cache:
+            t = DatasetType(code=code, name=code)
+            db.add(t)
             db.flush()
-            plat_cache[pname] = plat
+            type_cache[code] = t
 
-        brand = brand_cache.get((pname, bname))
-        if brand is None:
-            brand = Brand(name=bname, platform_id=plat.id)
-            db.add(brand)
-            db.flush()
-            brand_cache[(pname, bname)] = brand
+    # ── 车辆 / 属性 / 模式 / 单号 ──
+    vehicles_in_items: Dict[str, List[Dict[str, Any]]] = {}
+    for it in items:
+        vehicles_in_items.setdefault(it["vehicle"], []).append(it)
 
-        veh = veh_cache.get((vname, bname))
+    veh_cache: Dict[str, Vehicle] = {
+        v.name: v for v in db.execute(select(Vehicle)).scalars()
+    }
+    mode_ids: Dict[int, Dict[str, int]] = {}
+    order_ids: Dict[int, Dict[Tuple[str, str], int]] = {}
+
+    for vname in sorted(vehicles_in_items):
+        veh = veh_cache.get(vname)
         if veh is None:
-            veh = Vehicle(name=vname, brand_id=brand.id, extra_attrs={})
+            veh = Vehicle(name=vname)
             db.add(veh)
             db.flush()
-            veh_cache[(vname, bname)] = veh
-        # 属性以 CSV 为准；CSV 没给就保持原值（不要用 None 覆盖已有信息）
-        for attr in ("drive_type", "vin", "model_year"):
-            if m.get(attr) is not None:
-                setattr(veh, attr, m[attr])
-    db.commit()
+            veh_cache[vname] = veh
 
-    # ── 实验 / 指标 / 曲线 ──
-    n_exp = n_ind = n_cur = n_pts = 0
+        meta = vmeta.get(vname, {})
+        attrs: Dict[str, Any] = {}
+        for header, value in (meta.get("attrs") or {}).items():
+            code = header_codes.get(header)
+            if code:
+                attrs[code] = value
+        if attrs:
+            crud.set_vehicle_attrs(db, veh, attrs)
+
+        modes = list(meta.get("modes") or [])
+        orders = list(meta.get("orders") or [])
+        for it in vehicles_in_items[vname]:
+            if it.get("mode"):
+                modes.append(it["mode"])
+            if it.get("folder_order"):
+                orders.append({"discipline": "操稳", "order_no": it["folder_order"]})
+
+        mode_ids[veh.id] = _ensure_vehicle_modes(db, veh, modes)
+        order_ids[veh.id] = _ensure_test_orders(db, veh, orders)
+
+    db.flush()
+
+    # ── 数据集 / 指标 / 曲线 ──
+    n_ds = n_ind = n_cur = n_pts = 0
     done = 0
     total = len(items)
     for it in items:
-        veh = veh_cache[(it["vehicle"], vbrand[it["vehicle"]])]
+        veh = veh_cache[it["vehicle"]]
         cond = cond_cache[it["condition"]]
+        type_obj = type_cache[it.get("dataset_type") or DEFAULT_DATASET_TYPE]
+        mode_name = it.get("mode")
+        mode_id = (mode_ids.get(veh.id) or {}).get(mode_name) if mode_name else None
+
+        order_key = ("操稳", it["folder_order"]) if it.get("folder_order") else None
+        test_order_id = (order_ids.get(veh.id) or {}).get(order_key) if order_key else None
 
         if append:
-            # 覆盖语义：先清掉这台车在这个工况下的旧实验。
-            # Curve / Indicator 的外键是 ON DELETE CASCADE，数据库层会一起删。
-            db.query(Experiment).filter(
-                Experiment.vehicle_id == veh.id,
-                Experiment.condition_id == cond.id,
-            ).delete(synchronize_session=False)
-            db.flush()
-
-        exp_nos = sorted(it["payload"].keys(), key=exp_sort_key)
-        for order, exp_no in enumerate(exp_nos):
-            avg = is_average_key(exp_no)
-            blob = it["payload"][exp_no]
-            exp = Experiment(
-                vehicle_id=veh.id, condition_id=cond.id,
-                experiment_no="平均" if avg else exp_no,
-                is_average=avg,
-                sort_order=999 if avg else order,
+            # 覆盖语义：同一 slot 先删旧数据（Curve / MetricValue 由 FK 级联删除）
+            stmt = delete(Dataset).where(
+                Dataset.vehicle_id == veh.id,
+                Dataset.condition_id == cond.id,
+                Dataset.dataset_type_id == type_obj.id,
+                Dataset.name == it["condition"],
             )
-            db.add(exp)
+            if mode_id is None:
+                stmt = stmt.where(Dataset.mode_id.is_(None))
+            else:
+                stmt = stmt.where(Dataset.mode_id == mode_id)
+            db.execute(stmt)
             db.flush()
-            n_exp += 1
 
-            for rk, val in (blob["params"] or {}).items():
-                _s, nm, unit = parse_raw_key(str(rk))
-                if isinstance(val, dict):        # 防御：值是 dict 就取 value
-                    val = val.get("value")
-                fval: Optional[float] = None
-                tval: Optional[str] = None
-                try:
-                    fval = float(val) if val is not None else None
-                except (TypeError, ValueError):
-                    tval = str(val) if val is not None else None
-                db.add(Indicator(
-                    experiment_id=exp.id, name=nm, unit=unit,
-                    raw_key=str(rk), value=fval, text_value=tval,
-                    category=cond.category,
-                ))
-                n_ind += 1
+        if it["kind"] == "payload":
+            db.add(Dataset(
+                vehicle_id=veh.id, mode_id=mode_id,
+                test_order_id=test_order_id,
+                condition_id=cond.id, dataset_type_id=type_obj.id,
+                name=it["condition"], exp_no="1", is_average=False,
+                sort_order=0, payload=it["payload"],
+            ))
+            n_ds += 1
+        else:
+            exp_nos = sorted(it["experiments"].keys(), key=exp_sort_key)
+            for order, exp_no in enumerate(exp_nos):
+                avg = is_average_key(exp_no)
+                blob = it["experiments"][exp_no]
+                ds = Dataset(
+                    vehicle_id=veh.id, mode_id=mode_id,
+                    test_order_id=test_order_id,
+                    condition_id=cond.id, dataset_type_id=type_obj.id,
+                    name=it["condition"],
+                    exp_no="平均" if avg else exp_no,
+                    is_average=avg,
+                    sort_order=999 if avg else order,
+                )
+                db.add(ds)
+                db.flush()
+                n_ds += 1
 
-            for group, cdict in (("cal", blob["curves_cal"]),
-                                 ("duiqi", blob["curves_duiqi"])):
-                for corder, (ckey, cval) in enumerate((cdict or {}).items()):
-                    ser = cval.get("curve") or []
-                    npts = len(ser[0].get("x", [])) if ser else 0
-                    _s, cnm, _u = parse_raw_key(str(ckey))
-                    db.add(Curve(
-                        experiment_id=exp.id, group=group, name=str(ckey),
-                        title=cval.get("title") or cnm,
-                        xlabel=cval.get("xlabel"), ylabel=cval.get("ylabel"),
-                        series=ser, point_count=npts, sort_order=corder,
+                for rk, val in (blob.get("params") or {}).items():
+                    if isinstance(val, dict):
+                        val = val.get("value")
+                    _seq, nm, unit = parse_raw_key(str(rk))
+                    fval = _parse_float(val)
+                    tval = None if fval is not None else (
+                        None if val is None else str(val)
+                    )
+                    db.add(MetricValue(
+                        dataset_id=ds.id, name=nm, unit=unit, raw_key=str(rk),
+                        value=fval, text_value=tval, category=cond.category,
                     ))
-                    n_cur += 1
-                    n_pts += npts
+                    n_ind += 1
+
+                for group, cdict in (blob.get("curves") or {}).items():
+                    for corder, (ckey, cval) in enumerate((cdict or {}).items()):
+                        ser = cval.get("curve") or []
+                        npts = len(ser[0].get("x", [])) if ser else 0
+                        _s, cnm, _u = parse_raw_key(str(ckey))
+                        db.add(Curve(
+                            dataset_id=ds.id, group=group, name=str(ckey),
+                            title=cval.get("title") or cnm,
+                            xlabel=cval.get("xlabel"), ylabel=cval.get("ylabel"),
+                            series=ser, point_count=npts, sort_order=corder,
+                        ))
+                        n_cur += 1
+                        n_pts += npts
 
         done += 1
         if done % batch == 0:
@@ -794,14 +972,15 @@ def import_items(
 
     return {
         "files": total,
-        "experiments": n_exp,
+        "datasets": n_ds,
+        "experiments": n_ds,
         "indicators": n_ind,
         "curves": n_cur,
         "points": n_pts,
-        "platforms": len(plat_cache),
-        "brands": len(brand_cache),
         "vehicles": len(veh_cache),
         "conditions": len(cond_cache),
+        "modes": sum(len(v) for v in mode_ids.values()),
+        "dataset_types": len(type_cache),
         "seconds": round(time.time() - t0, 2),
     }
 

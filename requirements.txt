@@ -4,6 +4,7 @@ uvicorn[standard]>=0.24.0
 sqlalchemy>=2.0.0,<2.1
 pydantic>=2.0.0,<3
 python-dotenv>=1.0.0
+python-multipart>=0.0.9
 
 # 只在用 PostgreSQL 时需要；纯 SQLite 本地开发可以注释掉
 psycopg2-binary>=2.9.9
