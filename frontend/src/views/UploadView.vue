@@ -22,9 +22,10 @@
  *    `Promise.all(readAsArrayBuffer)` 会把原始字节全驻留。这里直接把
  *    `File` 塞进 FormData 交给浏览器流式发。
  */
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { uploadData, type UploadResult } from '@/api'
+import { getMeta, uploadData, type UploadResult } from '@/api'
+import type { DatasetType } from '@/types'
 
 interface Picked {
   file: File
@@ -40,6 +41,9 @@ const META_CSV = new Set([
 
 const picked = ref<Picked[]>([])
 const mode = ref<'replace' | 'append'>('replace')
+/** 本次数据按哪种格式解析。格式可扩展（操稳 / 平顺 / 通用…），来自配置 */
+const datasetTypes = ref<DatasetType[]>([])
+const datasetType = ref<string>('handling_stability')
 const busy = ref(false)
 const phase = ref<'' | 'preview' | 'import'>('')
 const progress = ref(0)
@@ -203,7 +207,12 @@ async function run(dryRun: boolean) {
   try {
     const res = await uploadData(
       picked.value.map((p) => p.file),
-      { paths: picked.value.map((p) => p.rel), mode: mode.value, dryRun },
+      {
+        paths: picked.value.map((p) => p.rel),
+        mode: mode.value,
+        dryRun,
+        datasetType: datasetType.value || undefined,
+      },
       (loaded, total) => {
         progress.value = total ? Math.round((loaded / total) * 100) : 0
       },
@@ -233,6 +242,16 @@ async function run(dryRun: boolean) {
     progress.value = 0
   }
 }
+
+onMounted(async () => {
+  try {
+    const meta = await getMeta()
+    datasetTypes.value = meta.dataset_types
+    if (datasetTypes.value.length) datasetType.value = datasetTypes.value[0].code
+  } catch {
+    /* 配置加载失败不挡上传：服务端会用默认格式 */
+  }
+})
 </script>
 
 <template>
@@ -243,7 +262,7 @@ async function run(dryRun: boolean) {
         <div class="head">
           <span class="ttl">选择数据文件夹</span>
           <span class="hint">
-            目录结构：<code>&lt;根&gt;/&lt;车型&gt;/&lt;工况&gt;.json</code>
+            目录结构：<code>&lt;根&gt;/&lt;车型&gt;/[&lt;模式&gt;/]&lt;工况&gt;.json</code>
             ，可另放 <code>vehicles.csv</code> / <code>conditions.csv</code>
           </span>
         </div>
@@ -327,6 +346,26 @@ async function run(dryRun: boolean) {
     <!-- ── 导入选项 ── -->
     <el-card shadow="never" class="card">
       <div class="ctrl-row">
+        <span class="ctrl-label">数据格式</span>
+        <el-select
+          v-model="datasetType"
+          size="small"
+          style="width: 150px"
+          :disabled="busy"
+        >
+          <el-option
+            v-for="t in datasetTypes"
+            :key="t.code"
+            :label="t.name"
+            :value="t.code"
+          />
+        </el-select>
+        <span class="hint">
+          决定这批文件按哪种格式解析（格式注册表可扩展，不影响已有数据）
+        </span>
+      </div>
+
+      <div class="ctrl-row second">
         <span class="ctrl-label">导入方式</span>
         <el-radio-group v-model="mode" size="small">
           <el-radio-button value="replace">清空后导入</el-radio-button>
@@ -392,14 +431,14 @@ async function run(dryRun: boolean) {
       <div class="grid">
         <div class="cell"><b>{{ fmtInt(result.summary.vehicles) }}</b><span>车型</span></div>
         <div class="cell"><b>{{ fmtInt(result.summary.conditions) }}</b><span>工况</span></div>
-        <div class="cell"><b>{{ fmtInt(result.summary.files) }}</b><span>车×工况文件</span></div>
-        <div class="cell"><b>{{ fmtInt(result.summary.experiments) }}</b><span>实验</span></div>
+        <div class="cell"><b>{{ fmtInt(result.summary.modes) }}</b><span>试验模式</span></div>
+        <div class="cell"><b>{{ fmtInt(result.summary.datasets) }}</b><span>数据集</span></div>
         <div class="cell"><b>{{ fmtInt(result.summary.indicators) }}</b><span>指标行</span></div>
         <div class="cell"><b>{{ fmtInt(result.summary.curves) }}</b><span>曲线</span></div>
         <div class="cell"><b>{{ fmtInt(result.summary.points) }}</b><span>采样点</span></div>
         <div class="cell" v-if="result.imported">
-          <b>{{ fmtInt(result.imported.platforms) }} / {{ fmtInt(result.imported.brands) }}</b>
-          <span>平台 / 品牌</span>
+          <b>{{ fmtInt(result.imported.dataset_types) }} / {{ fmtInt(result.imported.modes) }}</b>
+          <span>格式 / 模式</span>
         </div>
       </div>
 
@@ -413,6 +452,7 @@ async function run(dryRun: boolean) {
           {{ result.conditions_csv }}
         </el-tag>
         <el-tag v-else size="small" type="info">无 conditions.csv，工况分类为空</el-tag>
+        <el-tag size="small" effect="plain">数据格式 {{ result.dataset_type }}</el-tag>
         <el-tag v-if="result.curve_meta_fixed" size="small">
           补算 point_count {{ result.curve_meta_fixed }} 条
         </el-tag>
@@ -528,6 +568,11 @@ async function run(dryRun: boolean) {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+.ctrl-row.second {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed #eee;
 }
 .ctrl-label { font-size: 12px; color: #888; flex-shrink: 0; }
 .prog { margin-top: 12px; display: flex; align-items: center; gap: 12px; }

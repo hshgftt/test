@@ -52,7 +52,9 @@ from app.database import SessionLocal, get_db
 from app.schemas import (
     AttrDefIn,
     AttrDefUpdate,
+    CompareStreamIn,
     ConditionOut,
+    StatsQueryIn,
     TreeProfileOut,
     VehicleIn,
     VehicleUpdateIn,
@@ -144,6 +146,11 @@ def _parse_segments(raw: str) -> List[Tuple[int, Optional[int]]]:
     if not out:
         raise HTTPException(status_code=400, detail="segments 不能为空")
     return out
+
+
+def _parse_segment_items(items: Sequence[str]) -> List[Tuple[int, Optional[int]]]:
+    """与 ``_parse_segments`` 相同，但输入已经是拆好的列表（来自 JSON body）。"""
+    return _parse_segments(",".join(items))
 
 
 def _split_csv(value: Optional[str]) -> Optional[List[str]]:
@@ -486,25 +493,18 @@ def compare_segments(
     return json_response(data, t)
 
 
-@app.get(
-    "/api/compare/stream",
-    summary="多分析单元对比（NDJSON 流式，推荐）",
-    tags=["数据查询"],
-)
-def compare_stream(
-    segments: str = Query(..., description="vehicle_id:mode_id，逗号分隔"),
-    condition_id: int = Query(..., description="工况 ID"),
-    dataset_type: Optional[str] = Query(None),
-    exp: Optional[str] = Query(None),
-    curves: Optional[str] = Query(None, description="只取指定曲线名（强烈建议传）"),
-    exp_scope: Optional[str] = Query(None),
-    db: Session = Depends(get_db),
-):
-    segs = _parse_segments(segments)
-    picks = set(_split_csv(curves)) if curves else None
-    scope = _exp_scope_of(exp_scope)
+def _stream_compare_response(
+    db: Session,
+    segs: List[Tuple[int, Optional[int]]],
+    condition_id: int,
+    dataset_type: Optional[str],
+    exp_nos: Optional[List[str]],
+    curve_names: Optional[List[str]],
+    exp_scope: Optional[str],
+) -> StreamingResponse:
+    picks = set(curve_names) if curve_names else None
+    scope = exp_scope
     _check_compare_scale(db, segs, condition_id, picks, scope, dataset_type)
-    exp_nos = _split_csv(exp)
 
     def gen():
         s = SessionLocal()
@@ -533,6 +533,40 @@ def compare_stream(
     )
 
 
+@app.get(
+    "/api/compare/stream",
+    summary="多分析单元对比（NDJSON 流式，GET 版）",
+    tags=["数据查询"],
+)
+def compare_stream(
+    segments: str = Query(..., description="vehicle_id:mode_id，逗号分隔"),
+    condition_id: int = Query(..., description="工况 ID"),
+    dataset_type: Optional[str] = Query(None),
+    exp: Optional[str] = Query(None),
+    curves: Optional[str] = Query(None, description="只取指定曲线名（强烈建议传）"),
+    exp_scope: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    return _stream_compare_response(
+        db, _parse_segments(segments), condition_id, dataset_type,
+        _split_csv(exp), _split_csv(curves), _exp_scope_of(exp_scope),
+    )
+
+
+@app.post(
+    "/api/compare/stream",
+    summary="多分析单元对比（NDJSON 流式，POST 版，推荐）",
+    tags=["数据查询"],
+)
+def compare_stream_post(payload: CompareStreamIn, db: Session = Depends(get_db)):
+    """曲线名 / 工况名可能是中文，放 body 里避免 URL 编码问题。"""
+    return _stream_compare_response(
+        db, _parse_segment_items(payload.segments), payload.condition_id,
+        payload.dataset_type, payload.exp, payload.curves,
+        _exp_scope_of(payload.exp_scope),
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 指标统计
 # ═══════════════════════════════════════════════════════════════════════
@@ -541,6 +575,7 @@ def compare_stream(
 def get_all_indicators(
     request: Request,
     condition: Optional[str] = Query(None, description="工况名"),
+    condition_id: Optional[int] = Query(None, description="工况 ID（优先于名称）"),
     indicator: Optional[str] = Query(None, description="指标名"),
     average: bool = Query(False, description="true = 只统计平均实验"),
     dataset_type: Optional[str] = Query(None),
@@ -559,12 +594,34 @@ def get_all_indicators(
             db,
             filters=_filters_from_request(request),
             condition_name=condition,
+            condition_id=condition_id,
             indicator_name=indicator,
             average_only=average,
             dataset_type=dataset_type,
             mode_id=mode_id,
             limit=limit,
             offset=offset,
+        )
+    t.finish(rows=len(data.get("rows") or []), total=data.get("total"))
+    return json_response(data, t)
+
+
+@app.post("/api/indicators/all", summary="指标统计（POST 版，推荐）", tags=["统计"])
+def post_all_indicators(payload: StatsQueryIn, db: Session = Depends(get_db)):
+    """工况名 / 字段值可能是中文，放 body 里避免 URL 编码问题。"""
+    t = Timer("indicators_all")
+    with t.stage("db"):
+        data = crud.get_all_indicators_flat(
+            db,
+            filters=payload.filters,
+            condition_name=payload.condition,
+            condition_id=payload.condition_id,
+            indicator_name=payload.indicator,
+            average_only=payload.average,
+            dataset_type=payload.dataset_type,
+            mode_id=payload.mode_id,
+            limit=payload.limit,
+            offset=payload.offset,
         )
     t.finish(rows=len(data.get("rows") or []), total=data.get("total"))
     return json_response(data, t)

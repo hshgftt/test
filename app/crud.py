@@ -1280,6 +1280,7 @@ def _indicator_key_stmt(
     average_only: bool,
     dataset_type: Optional[str],
     mode_id: Optional[int] = None,
+    condition_id: Optional[int] = None,
 ):
     stmt = (
         select(
@@ -1305,7 +1306,9 @@ def _indicator_key_stmt(
         stmt = stmt.where(Dataset.vehicle_id.in_(list(vehicle_ids)))
     if mode_id is not None:
         stmt = stmt.where(Dataset.mode_id == mode_id)
-    if condition_name:
+    if condition_id is not None:
+        stmt = stmt.where(Dataset.condition_id == condition_id)
+    elif condition_name:
         stmt = stmt.where(Condition.name == condition_name)
     if average_only:
         stmt = stmt.where(Dataset.is_average.is_(True))
@@ -1327,6 +1330,7 @@ def get_all_indicators_flat(
     mode_id: Optional[int] = None,
     limit: int = 200,
     offset: int = 0,
+    condition_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """分页的指标统计表。
 
@@ -1340,7 +1344,7 @@ def get_all_indicators_flat(
 
     key_stmt = _indicator_key_stmt(
         vehicle_ids, condition_name, indicator_name, average_only,
-        dataset_type, mode_id,
+        dataset_type, mode_id, condition_id,
     )
     total = int(db.execute(
         select(func.count()).select_from(key_stmt.subquery())

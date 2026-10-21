@@ -288,4 +288,35 @@ class StatsPageOut(BaseModel):
     rows: List[StatsRowOut] = Field(default_factory=list)
 
 
+# ── 请求体（替代把中文放进 URL query）──────────────────────────────────
+#
+# 工况名 / 曲线名 / 字段值都可能是中文。某些反向代理会把百分号编码解码后
+# 以原始字节转发，HTTP 解析器直接 400。把这些参数放 JSON body 就不存在
+# 编码问题，也不会撞 URL 长度上限。
+
+class CompareStreamIn(BaseModel):
+    """POST /api/compare/stream 的请求体。"""
+    segments: List[str] = Field(
+        default_factory=list, description="'vehicle_id:mode_id' 列表",
+    )
+    condition_id: int
+    dataset_type: Optional[str] = None
+    exp: Optional[List[str]] = None
+    curves: Optional[List[str]] = None
+    exp_scope: Optional[str] = None
+
+
+class StatsQueryIn(BaseModel):
+    """POST /api/indicators/all 的请求体。"""
+    filters: Dict[str, str] = Field(default_factory=dict)
+    condition: Optional[str] = None
+    condition_id: Optional[int] = None
+    indicator: Optional[str] = None
+    average: bool = False
+    dataset_type: Optional[str] = None
+    mode_id: Optional[int] = None
+    limit: int = 200
+    offset: int = 0
+
+
 NavNodeOut.model_rebuild()

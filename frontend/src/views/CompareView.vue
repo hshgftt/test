@@ -3,17 +3,39 @@ import { computed, nextTick, onMounted, ref, shallowRef, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import VehicleTree from '@/components/VehicleTree.vue'
 import CurveChart, { type ChartLine } from '@/components/CurveChart.vue'
-import { getCompare, getConditions, getLastTiming, streamCompare, type StreamCurveEvent, type Timing } from '@/api'
-import type { CompareResponse, Condition, CurveMeta, Experiment, Indicator } from '@/types'
+import {
+  getCompare,
+  getConditions,
+  getLastTiming,
+  segmentKey,
+  streamCompare,
+  type StreamCurveEvent,
+  type Timing,
+} from '@/api'
+import type {
+  CompareResponse,
+  Condition,
+  CurveMeta,
+  Experiment,
+  Indicator,
+  SegmentRef,
+} from '@/types'
 
 // ── conditions ──
 const conditions = ref<Condition[]>([])
 const conditionId = ref<number | null>(null)
 
 // ── selection ──
-const selectedIds = ref<number[]>([])
-function onTreeChange(ids: number[]) {
-  selectedIds.value = ids
+/**
+ * 勾选的是**分析单元**（车 × 模式），不是车 id。
+ * 同一台车选了「舒适」和「运动」就是两个独立单元，对比表各占一列。
+ */
+const selectedSegments = ref<SegmentRef[]>([])
+const selectedKeys = computed(() =>
+  selectedSegments.value.map((s) => segmentKey(s.vehicle_id, s.mode_id)),
+)
+function onTreeChange(segs: SegmentRef[]) {
+  selectedSegments.value = segs
 }
 
 // ── data ──
@@ -100,6 +122,8 @@ const DS_THRESHOLD: number | null = 10000
 interface TableCol {
   key: string
   vehicleName: string
+  /** 试验模式；没有模式时为 null */
+  mode: string | null
   expNo: string
   isAverage: boolean
 }
@@ -121,7 +145,7 @@ const curveMetas = computed<CurveMeta[]>(() => {
 const allExpNos = computed<string[]>(() => {
   const set = new Set<string>()
   for (const v of data.value?.vehicles ?? []) {
-    for (const e of v.experiments) set.add(e.experiment_no)
+    for (const e of v.experiments) set.add(e.exp_no)
   }
   return [...set].sort((a, b) => {
     if (a === '平均') return 1
@@ -229,14 +253,19 @@ function applyCurveEvent(ev: StreamCurveEvent) {
   const pool =
     ev.vehicle_id == null
       ? cur.vehicles
-      : cur.vehicles.filter((v) => v.vehicle_id === ev.vehicle_id)
+      : cur.vehicles.filter(
+          (v) =>
+            v.vehicle_id === ev.vehicle_id &&
+            (v.mode_id ?? null) === (ev.mode_id ?? null),
+        )
   let target: Experiment | undefined
   for (const v of pool) {
-    target = v.experiments.find((x) => x.experiment_id === ev.experiment_id)
+    target = v.experiments.find((x) => x.dataset_id === ev.dataset_id)
     if (target) break
   }
   if (!target) return
-  const bucket = ev.group === 'cal' ? target.curves_cal : target.curves_duiqi
+  // 分组（cal / duiqi / 以后的新分组）完全由数据决定，不写死
+  const bucket = target.curves?.[ev.group]
   const tgt = bucket?.[ev.curve.name]
   if (!tgt) return
   tgt.series = ev.curve.series ?? []
@@ -272,7 +301,7 @@ async function loadCurves(names: string[], gen: number = loadGen) {
   try {
     for (const batch of planBatches(todo)) {
       await streamCompare(
-        selectedIds.value,
+        selectedKeys.value,
         conditionId.value,
         { curves: batch, expScope: requestScope.value },
         {
@@ -304,8 +333,8 @@ async function loadData() {
     ElMessage.warning('请选择工况')
     return
   }
-  if (!selectedIds.value.length) {
-    ElMessage.warning('请至少选择一台车')
+  if (!selectedKeys.value.length) {
+    ElMessage.warning('请至少选择一个分析单元')
     return
   }
   // 掐断上一次在途的流 —— 切工况 / 重复点击时别让服务端白算一遍
@@ -318,7 +347,7 @@ async function loadData() {
   try {
     // ── 第一阶段：只要骨架（车辆 + 指标 + 曲线元信息，不含 series）──
     //    200 车 / 稳态回转实测 811 KB / 0.1s，所以表格和曲线选择区立刻出来
-    const meta = await getCompare(selectedIds.value, conditionId.value, {
+    const meta = await getCompare(selectedKeys.value, conditionId.value, {
       metaOnly: true,
       expScope: requestScope.value,
     })
@@ -464,7 +493,7 @@ function expsFor(expList: Experiment[]): Experiment[] {
     const avg = expList.filter((e) => e.is_average)
     if (avg.length) return avg
     // 没有平均 → 退回第一次实验，避免图上一片空白
-    const first = expList.find((e) => e.experiment_no === '1')
+    const first = expList.find((e) => e.exp_no === '1')
     return first ? [first] : expList.slice(0, 1)
   }
   return expList
@@ -503,15 +532,16 @@ const indicatorRows = computed<Indicator[]>(() => {
 })
 
 /**
- * 表格列：每 (车 × 实验) 一列。
+ * 表格列：每 (分析单元 × 实验) 一列。
  *
  * ── 口径只分两种：仅平均 / 全部实验 ──
  *
  * 每台车每个工况的实验次数**不固定**，所以不做「勾选若干实验号」这种集合模型
  * （次数一变 UI 就崩），只用布尔口径来判断。
  *
- * key 用 `experiment_id`（全局唯一）而不是 experiment_no ——
+ * key 用 `dataset_id`（全局唯一）而不是实验号 ——
  * 实验号在不同车之间会重号（都有 '1'、'2'、'平均'），拼字符串做 key 有撞的风险。
+ * 列头额外带模式，否则同一台车的舒适 / 运动两列看起来一模一样。
  */
 const tableCols = computed<TableCol[]>(() => {
   if (!data.value) return []
@@ -520,9 +550,10 @@ const tableCols = computed<TableCol[]>(() => {
     for (const e of v.experiments) {
       if (tableOnlyAverage.value && !e.is_average) continue
       cols.push({
-        key: `exp_${e.experiment_id}`,
+        key: `exp_${e.dataset_id}`,
         vehicleName: v.vehicle_name,
-        expNo: e.experiment_no,
+        mode: v.mode,
+        expNo: e.exp_no,
         isAverage: e.is_average,
       })
     }
@@ -543,7 +574,7 @@ const tableRows = computed(() => {
     for (const v of data.value!.vehicles) {
       for (const e of v.experiments) {
         if (tableOnlyAverage.value && !e.is_average) continue
-        const key = `exp_${e.experiment_id}`
+        const key = `exp_${e.dataset_id}`
         const val = e.params?.[ind.raw_key]?.value
         row[key] = val == null ? '-' : Number(val.toFixed(4))
       }
@@ -568,20 +599,22 @@ function linesForCurve(curveName: string): ChartLine[] {
   const lines: ChartLine[] = []
   for (const v of data.value.vehicles) {
     for (const e of expsFor(v.experiments)) {
-      const curves = group.value === 'cal' ? e.curves_cal : e.curves_duiqi
-      const curve = curves?.[curveName]
+      // 分组名是数据驱动的，不假设只有 cal / duiqi
+      const curve = e.curves?.[group.value]?.[curveName]
       if (!curve) continue
       const list = curve.series ?? []
       if (!list.length) continue
-      const expSuffix = expScope.value === '平均' ? '' : ` #${e.experiment_no}`
+      const expSuffix = expScope.value === '平均' ? '' : ` #${e.exp_no}`
+      // 同一台车可能有多个模式 → 线名必须带上模式，否则两张图的图例重名
+      const owner = v.mode ? `${v.vehicle_name} · ${v.mode}` : v.vehicle_name
       const multi = list.length > 1
       for (let i = 0; i < list.length; i++) {
         const s = list[i]
         const kind = s.curvename ?? `series${i}`
         lines.push({
           name: multi
-            ? `${v.vehicle_name} · ${kind}${expSuffix}`
-            : `${v.vehicle_name}${expSuffix}`,
+            ? `${owner} · ${kind}${expSuffix}`
+            : `${owner}${expSuffix}`,
           x: s.x,
           y: s.y,
         })
@@ -868,7 +901,9 @@ onMounted(loadConditions)
             >
               <template #header>
                 <div class="col-head">
-                  <span class="veh">{{ c.vehicleName }}</span>
+                  <span class="veh">
+                    {{ c.vehicleName }}<template v-if="c.mode"> · {{ c.mode }}</template>
+                  </span>
                   <span class="exp">{{ c.isAverage ? '平均' : `第${c.expNo}次` }}</span>
                 </div>
               </template>
