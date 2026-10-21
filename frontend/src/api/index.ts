@@ -255,30 +255,39 @@ export function getCompare(
 
 // ── 指标统计 ───────────────────────────────────────────────────────────
 
-export function getAllIndicatorsFlat(params?: {
+export interface IndicatorsQuery {
   /** 任意字段过滤：key 是 attr_defs.code */
   filters?: Record<string, string>
   condition?: string
+  /** 工况 ID（优先于名字，避免把中文放进 URL query） */
+  condition_id?: number
   indicator?: string
-  /** true = 只统计平均实验 */
   average?: boolean
   dataset_type?: string
   mode_id?: number
   limit?: number
   offset?: number
-}): Promise<StatsPage> {
-  const query: Record<string, string | number | boolean> = {}
-  for (const [code, value] of Object.entries(params?.filters ?? {})) {
-    if (value !== '') query[`f_${code}`] = value
-  }
-  if (params?.condition) query.condition = params.condition
-  if (params?.indicator) query.indicator = params.indicator
-  if (params?.average !== undefined) query.average = params.average
-  if (params?.dataset_type) query.dataset_type = params.dataset_type
-  if (params?.mode_id !== undefined) query.mode_id = params.mode_id
-  if (params?.limit !== undefined) query.limit = params.limit
-  if (params?.offset !== undefined) query.offset = params.offset
-  return timed(http.get('/indicators/all', { params: query }))
+}
+
+/**
+ * 指标统计。
+ *
+ * 工况名是中文（角阶跃 / 稳态回转），部分反向代理会把百分号编码解码后再转发，
+ * 导致 uvicorn 在 HTTP 层直接 400。所以**默认走 POST + JSON body**，
+ * 把所有可能含中文的参数从 URL 剥离出去。
+ */
+export function getAllIndicatorsFlat(params?: IndicatorsQuery): Promise<StatsPage> {
+  const body: Record<string, unknown> = {}
+  if (params?.filters) body.filters = params.filters
+  if (params?.condition_id !== undefined) body.condition_id = params.condition_id
+  if (params?.condition) body.condition = params.condition
+  if (params?.indicator) body.indicator = params.indicator
+  if (params?.average !== undefined) body.average = params.average
+  if (params?.dataset_type) body.dataset_type = params.dataset_type
+  if (params?.mode_id !== undefined) body.mode_id = params.mode_id
+  if (params?.limit !== undefined) body.limit = params.limit
+  if (params?.offset !== undefined) body.offset = params.offset
+  return timed(http.post('/indicators/all', body))
 }
 
 // ── 上传导入 ─────────────────────────────────────────────────────────────
@@ -416,7 +425,11 @@ export interface StreamHandlers {
 }
 
 /**
- * 流式拉多 segment 对比数据（`/api/compare/stream`，NDJSON）。
+ * 流式拉多 segment 对比数据（`/api/compare/stream`，NDJSON，**POST**）。
+ *
+ * 曲线名可能是中文（如「方向盘转角-时间」）。放进 URL query 会被某些代理
+ * 解码成原始字节，uvicorn/h11 直接 400。所以改用 fetch + body POST，
+ * 并手动读取 NDJSON 流（axios 不支持流式 response body）。
  *
  * 第一行 meta 到手就能渲染表格和曲线选择区，不用等最后一条曲线。
  *
@@ -429,26 +442,30 @@ export async function streamCompare(
   h: StreamHandlers = {},
   signal?: AbortSignal,
 ): Promise<void> {
-  const params = new URLSearchParams()
-  params.set('segments', segments.join(','))
-  params.set('condition_id', String(conditionId))
-  if (q.datasetType) params.set('dataset_type', q.datasetType)
-  if (q.exp?.length) params.set('exp', q.exp.join(','))
-  if (q.curves?.length) params.set('curves', q.curves.join(','))
-  if (q.expScope) params.set('exp_scope', q.expScope)
-
   const t0 = performance.now()
-  const res = await fetch(`/api/compare/stream?${params}`, { signal })
+  const res = await fetch('/api/compare/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      segments,
+      condition_id: conditionId,
+      dataset_type: q.datasetType ?? null,
+      exp: q.exp ?? null,
+      curves: q.curves ?? null,
+      exp_scope: q.expScope ?? null,
+    }),
+    signal,
+  })
 
   if (!res.ok) {
-    // 准入检查（400）发生**在开始流之前**，所以是一个干净的 JSON 响应
     const text = await res.text().catch(() => '')
     let msg = `HTTP ${res.status}`
     try {
       const j = JSON.parse(text)
       if (j?.detail) msg = j.detail
+      else if (j?.message) msg = j.message
     } catch {
-      /* 保持默认信息 */
+      if (text) msg = `${msg}: ${text.slice(0, 120)}`
     }
     throw new Error(msg)
   }

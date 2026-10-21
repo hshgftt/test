@@ -143,7 +143,8 @@ async function loadData() {
   try {
     const resp = await getAllIndicatorsFlat({
       filters: { ...filters },
-      condition: conditionName.value || undefined,
+      // 用 ID 不用名字（中文名进 URL query 会被某些代理解码成原始字节导致 400）
+      condition_id: conditionId.value ?? undefined,
       average: expScope.value === '平均',
       dataset_type: datasetType.value || undefined,
       limit: pageSize.value,
