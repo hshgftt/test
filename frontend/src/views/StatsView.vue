@@ -95,6 +95,73 @@ const allRows = ref<Row[]>([])
 const indCols = ref<IndCol[]>([])
 const hasAverage = ref(false)
 
+// ── 列可见性 ───────────────────────────────────────────────────────────
+//
+// 固定列只有「车名 / 试验模式 / 实验」三列，其余全部可选：
+// 属性列（attr_defs 里 show_in_list 的那些）默认**不显示** —— 十几列属性
+// 铺开就把指标挤到屏幕外了；指标列默认全显示，按需关掉。
+// 偏好存 localStorage，换工况 / 刷新后保持。
+
+const COL_PREF_KEY = 'vedb.stats.columns.v1'
+
+/** code → 是否显示；缺省为 false（属性默认收起） */
+const attrVisible = ref<Record<string, boolean>>({})
+/** rawKey → 是否显示；缺省为 true（指标默认展开） */
+const indVisible = ref<Record<string, boolean>>({})
+
+function loadColPref() {
+  try {
+    const raw = localStorage.getItem(COL_PREF_KEY)
+    if (!raw) return
+    const p = JSON.parse(raw)
+    if (p?.attrs && typeof p.attrs === 'object') attrVisible.value = p.attrs
+    if (p?.inds && typeof p.inds === 'object') indVisible.value = p.inds
+  } catch {
+    // 偏好坏了就当没有，不影响查询
+  }
+}
+
+function saveColPref() {
+  try {
+    localStorage.setItem(
+      COL_PREF_KEY,
+      JSON.stringify({ attrs: attrVisible.value, inds: indVisible.value }),
+    )
+  } catch {
+    // 隐私模式写不进去，忽略
+  }
+}
+
+const visibleAttrs = computed(() => listAttrs.value.filter((a) => attrVisible.value[a.code] === true))
+const visibleInds = computed(() => indCols.value.filter((c) => indVisible.value[c.rawKey] !== false))
+
+const hiddenAttrCount = computed(() => listAttrs.value.length - visibleAttrs.value.length)
+const hiddenIndCount = computed(() => indCols.value.length - visibleInds.value.length)
+
+function setAttr(code: string, on: boolean) {
+  attrVisible.value = { ...attrVisible.value, [code]: on }
+  saveColPref()
+}
+
+function setInd(key: string, on: boolean) {
+  indVisible.value = { ...indVisible.value, [key]: on }
+  saveColPref()
+}
+
+function toggleAllAttrs(on: boolean) {
+  const next: Record<string, boolean> = {}
+  for (const a of listAttrs.value) next[a.code] = on
+  attrVisible.value = next
+  saveColPref()
+}
+
+function toggleAllInds(on: boolean) {
+  const next: Record<string, boolean> = {}
+  for (const c of indCols.value) next[c.rawKey] = on
+  indVisible.value = next
+  saveColPref()
+}
+
 function flatten(resp: StatsPage) {
   const outRows: Row[] = []
   const map = new Map<string, IndCol>()
@@ -216,17 +283,20 @@ function exportCsv() {
     ElMessage.warning('暂无数据')
     return
   }
+  // 导出与屏幕上的列保持一致（所见即所得），避免导出一堆隐藏列
   const head = [
-    ...listAttrs.value.map((a) => a.name),
+    '车名',
+    ...visibleAttrs.value.map((a) => a.name),
     '试验模式',
     '实验',
-    ...indCols.value.map((c) => (c.unit ? `${c.name}(${c.unit})` : c.name)),
+    ...visibleInds.value.map((c) => (c.unit ? `${c.name}(${c.unit})` : c.name)),
   ]
   const body = rows.value.map((r) => [
-    ...listAttrs.value.map((a) => String(r[a.code] ?? '')),
+    r.vehicle,
+    ...visibleAttrs.value.map((a) => String(r[a.code] ?? '')),
     r.mode ?? '',
     r.isAverage ? '平均' : `第${r.experiment}次`,
-    ...indCols.value.map((c) => String(r[c.rawKey] ?? '')),
+    ...visibleInds.value.map((c) => String(r[c.rawKey] ?? '')),
   ])
   const csv = [head, ...body]
     .map((line) => line.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(','))
@@ -242,11 +312,15 @@ function exportCsv() {
   URL.revokeObjectURL(url)
 }
 
-const summary = computed(
-  () => `${rows.value.length} 行 / 共 ${total.value} 行 · ${indCols.value.length} 项指标`,
-)
+const summary = computed(() => {
+  const shown = visibleInds.value.length
+  const all = indCols.value.length
+  const ind = shown === all ? `${all} 项指标` : `${shown}/${all} 项指标`
+  return `${rows.value.length} 行 / 共 ${total.value} 行 · ${ind}`
+})
 
 onMounted(async () => {
+  loadColPref()
   try {
     const [m, vehicles] = await Promise.all([getMeta(), getVehicles()])
     meta.value = m
@@ -350,6 +424,61 @@ onMounted(async () => {
         <el-button size="small" :disabled="!rows.length" @click="exportCsv">
           导出 CSV
         </el-button>
+
+        <!-- 列设置：属性列 + 指标列都能开关，偏好存本地 -->
+        <el-popover placement="bottom-end" :width="300" trigger="click">
+          <template #reference>
+            <el-button size="small">
+              列设置
+              <span v-if="hiddenAttrCount + hiddenIndCount" class="hidden-n">
+                隐藏 {{ hiddenAttrCount + hiddenIndCount }}
+              </span>
+            </el-button>
+          </template>
+          <div class="col-panel">
+            <div class="col-group">
+              <div class="col-group-head">
+                <span>车辆属性</span>
+                <span class="col-actions">
+                  <el-button link size="small" @click="toggleAllAttrs(true)">全选</el-button>
+                  <el-button link size="small" @click="toggleAllAttrs(false)">清空</el-button>
+                </span>
+              </div>
+              <div v-if="!listAttrs.length" class="col-empty">没有可显示的属性</div>
+              <div v-else class="col-list">
+                <el-checkbox
+                  v-for="a in listAttrs"
+                  :key="a.code"
+                  :model-value="attrVisible[a.code] === true"
+                  size="small"
+                  @change="(v: any) => setAttr(a.code, !!v)"
+                >{{ a.name }}</el-checkbox>
+              </div>
+            </div>
+
+            <el-divider class="col-divider" />
+
+            <div class="col-group">
+              <div class="col-group-head">
+                <span>指标（{{ indCols.length }}）</span>
+                <span class="col-actions">
+                  <el-button link size="small" @click="toggleAllInds(true)">全选</el-button>
+                  <el-button link size="small" @click="toggleAllInds(false)">清空</el-button>
+                </span>
+              </div>
+              <div v-if="!indCols.length" class="col-empty">先查询一次</div>
+              <div v-else class="col-list">
+                <el-checkbox
+                  v-for="c in indCols"
+                  :key="c.rawKey"
+                  :model-value="indVisible[c.rawKey] !== false"
+                  size="small"
+                  @change="(v: any) => setInd(c.rawKey, !!v)"
+                >{{ c.name }}</el-checkbox>
+              </div>
+            </div>
+          </div>
+        </el-popover>
       </div>
       <div class="ctrl-row second">
         <span class="hint">
@@ -371,14 +500,18 @@ onMounted(async () => {
         size="small"
         height="calc(100vh - 260px)"
       >
-        <!-- 车辆属性列：数量与名称都由 attr_defs 决定 -->
+        <!-- 车名：固定列，永远显示 -->
+        <el-table-column prop="vehicle" label="车名" width="140" fixed>
+          <template #default="{ row }">{{ row.vehicle ?? '-' }}</template>
+        </el-table-column>
+
+        <!-- 车辆属性列：数量与名称都由 attr_defs 决定，可在「列设置」里开关 -->
         <el-table-column
-          v-for="a in listAttrs"
+          v-for="a in visibleAttrs"
           :key="a.code"
           :prop="a.code"
           :label="a.name"
           min-width="98"
-          fixed
         >
           <template #default="{ row }">{{ row[a.code] ?? '-' }}</template>
         </el-table-column>
@@ -396,7 +529,7 @@ onMounted(async () => {
         </el-table-column>
 
         <el-table-column
-          v-for="c in indCols"
+          v-for="c in visibleInds"
           :key="c.rawKey"
           :prop="c.rawKey"
           min-width="130"
@@ -459,4 +592,31 @@ onMounted(async () => {
 .col-head .nm { display: block; font-size: 11px; }
 .col-head .un { display: block; font-size: 10px; color: #aaa; }
 .na { color: #ccc; }
+
+/* ── 列设置面板 ── */
+.hidden-n {
+  margin-left: 4px;
+  font-size: 11px;
+  color: #e6a23c;
+}
+.col-panel { max-height: 62vh; overflow-y: auto; }
+.col-group-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: #666;
+  margin-bottom: 6px;
+}
+.col-actions { display: flex; gap: 2px; }
+.col-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  max-height: 190px;
+  overflow-y: auto;
+}
+.col-list :deep(.el-checkbox) { margin-right: 0; height: 24px; }
+.col-divider { margin: 8px 0; }
+.col-empty { font-size: 12px; color: #bbb; padding: 2px 0 6px; }
 </style>

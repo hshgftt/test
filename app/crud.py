@@ -348,6 +348,26 @@ def get_nav_tree(
 
     allow = _filter_vehicle_ids(attrs_map, filters or {}) if filters else None
 
+    # ── 防御：全车都缺的属性层会把整棵树筛空 ──
+    # 某层配成 missing='skip'、而所有车都没填这个属性时，每台车走到该层
+    # 就被丢弃，界面上一个节点都看不到（只剩空树）。「这一层没数据」和
+    # 「这些车不满足条件」是两回事 —— 直接把这一层从投影里摘掉，树退化成
+    # 剩下的层级，总比空树有用。有过滤条件时不处理：那时筛空是预期结果。
+    empty_codes: List[str] = []
+    if vehicles and allow is None:
+        empty_codes = [
+            lv.get("key") for lv in levels
+            if lv.get("source") == "attr"
+            and lv.get("missing", "skip") == "skip"
+            and not any(
+                (attrs_map.get(v.id, {}).get(lv.get("key")) or {}).get("value")
+                not in (None, "")
+                for v in vehicles
+            )
+        ]
+        if empty_codes:
+            levels = [lv for lv in levels if lv.get("key") not in empty_codes]
+
     roots: List[Dict[str, Any]] = []
     root_index: Dict[str, Dict[str, Any]] = {}
     wants_modes = any(lv.get("source") == "test_mode" for lv in levels)
@@ -464,6 +484,8 @@ def get_nav_tree(
         },
         "levels": levels,
         "nodes": finalize(roots),
+        # 因「全车都缺该属性」而被临时降级为 missing='label' 的层
+        "degraded_levels": empty_codes,
     }
 
 

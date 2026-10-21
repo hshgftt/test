@@ -500,6 +500,48 @@ onMounted(async () => {
       >
         <span class="hint">{{ result.skipped.slice(0, 10).join('、') }}</span>
       </el-alert>
+
+      <!-- 文件名不像工况名，靠内容里的指标名改判的 -->
+      <el-alert
+        v-if="result.inferred_count"
+        type="info"
+        show-icon
+        :closable="false"
+        class="tip"
+        :title="`${result.inferred_count} 个文件按指标内容判定工况`"
+      >
+        <div v-for="e in result.inferred_conditions.slice(0, 10)" :key="e.file" class="err-row">
+          <span class="frel">{{ e.filename }}</span>
+          <span class="emsg">→ {{ e.condition }}</span>
+        </div>
+        <div v-if="result.inferred_count > 10" class="hint">
+          … 还有 {{ result.inferred_count - 10 }} 个
+        </div>
+      </el-alert>
+
+      <!-- 文件名和内容都定不下来的 -->
+      <el-alert
+        v-if="result.unresolved_conditions?.length"
+        type="warning"
+        show-icon
+        :closable="false"
+        class="tip"
+        :title="`${result.unresolved_conditions.length} 个文件定不出工况，已按文件名当工况名`"
+      >
+        <div
+          v-for="e in result.unresolved_conditions.slice(0, 10)"
+          :key="e.file"
+          class="err-row"
+        >
+          <span class="frel">{{ e.filename }}</span>
+          <span class="emsg">
+            最像：{{ e.candidates.length ? e.candidates.join('、') : '无' }}
+          </span>
+        </div>
+        <div class="hint">
+          文件名里带上工况名就能直接对上，比如 20241021_角阶跃_001.cw
+        </div>
+      </el-alert>
     </el-card>
   </div>
 </template>

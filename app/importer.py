@@ -30,7 +30,7 @@ import json
 import os
 import re
 import time
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy import delete, select
 
@@ -52,7 +52,9 @@ from app.models import (
 AVG_KEYS = {"平均", "avg", "average", "AVE", "AVE."}
 CURVE_GROUP_KEYS = ("curve", "curves", "series")
 
-MSGPACK_EXTS = (".msgpack", ".msg", ".mpack")
+# ``.cw`` 是业务侧自定义的 msgpack 后缀，内容与 .msgpack 完全一致。
+# 判断格式时后缀优先，后缀不认识再嗅探首字节（见 load_data_bytes）。
+MSGPACK_EXTS = (".msgpack", ".msg", ".mpack", ".cw")
 JSON_EXTS = (".json",)
 READABLE_EXTS: Tuple[str, ...] = JSON_EXTS + MSGPACK_EXTS
 
@@ -169,6 +171,109 @@ def parse_raw_key(raw_key: str) -> Tuple[Optional[int], str, Optional[str]]:
 
 def is_average_key(k: str) -> bool:
     return str(k).strip() in AVG_KEYS
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 工况识别：文件名不可靠时，靠内容里的指标名反推
+# ═══════════════════════════════════════════════════════════════════════
+
+def collect_metric_names(experiments: Dict[str, Dict[str, Any]]) -> Set[str]:
+    """从 parse_payload 的结果里取指标名（已剥掉数字前缀和单位）。
+
+    只认 params。曲线名带通道后缀，各工况重名太多，区分度不如指标。
+    """
+    out: Set[str] = set()
+    for exp in (experiments or {}).values():
+        params = exp.get("params") if isinstance(exp, dict) else None
+        if not isinstance(params, dict):
+            continue
+        for raw_key in params:
+            _seq, name, _unit = parse_raw_key(str(raw_key))
+            if name:
+                out.add(name)
+    return out
+
+
+def build_condition_index(db) -> Dict[str, Set[str]]:
+    """``{工况名: 该工况下出现过的指标名}``，从库里已有数据反推。
+
+    不维护规则表：真实工况的指标组合是稳定的，同一个工况换个文件名
+    也能靠指标名认出来。
+
+    这是**尽力而为**的辅助信息 —— 全新库还没建表时直接返回空，让导入
+    退回「只靠文件名」的老路；不能因为拿不到索引就把上传整个打死。
+    """
+    try:
+        rows = db.execute(
+            select(Condition.name, MetricValue.name)
+            .join(Dataset, Dataset.condition_id == Condition.id)
+            .join(MetricValue, MetricValue.dataset_id == Dataset.id)
+            .distinct()
+        )
+        out: Dict[str, Set[str]] = {}
+        for cname, mname in rows:
+            if cname and mname:
+                out.setdefault(cname, set()).add(mname)
+        return out
+    except Exception:                             # noqa: BLE001
+        # 表不存在 / 库还没初始化。回滚失败的事务，别污染调用方的 session。
+        db.rollback()
+        return {}
+
+
+def rank_conditions(
+    names: Set[str],
+    index: Dict[str, Set[str]],
+    top: int = 3,
+) -> List[Tuple[float, str]]:
+    """按指标名覆盖率给工况打分，降序返回前 ``top`` 个。"""
+    scored: List[Tuple[float, str]] = []
+    if not names or not index:
+        return scored
+    for cname, known in index.items():
+        if not known:
+            continue
+        hit = len(names & known)
+        if not hit:
+            continue
+        scored.append((hit / min(len(names), len(known)), cname))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return scored[:top]
+
+
+def infer_condition(
+    names: Set[str],
+    index: Dict[str, Set[str]],
+    threshold: float = 0.5,
+) -> Optional[str]:
+    """按指标名重合度挑最像的工况；认不出返回 None。
+
+    分母用 ``min(len)`` 而不是并集：一份数据可能只带该工况的部分指标，
+    但不会带上别的工况的指标 —— 覆盖率比 Jaccard 更贴合这种情形。
+
+    **并列最高时返回 None。** 同一族试验（比如「角阶跃 / 角阶跃-高速 /
+    侧向风敏感性」）的指标名可能完全一样，光看指标分不出来。这种情况
+    宁可认不出、保留文件名，也不能随便挑一个 —— 归错工况比归不了更难发现。
+    """
+    scored = rank_conditions(names, index, top=2)
+    if not scored:
+        return None
+    best_score, best = scored[0]
+    if best_score < threshold:
+        return None
+    if len(scored) > 1 and scored[1][0] == best_score:
+        return None
+    return best
+
+
+def match_condition_by_name(stem: str, known: Set[str]) -> Optional[str]:
+    """文件名里含已知工况名就认，取最长匹配。
+
+    取最长是为了让 ``角阶跃-高速`` 赢过 ``角阶跃`` —— 否则前缀相同的
+    工况会被短的抢走。这样 ``20241021_角阶跃-高速_001.json`` 也能对上。
+    """
+    hits = [c for c in known if c and c in stem]
+    return max(hits, key=len) if hits else None
 
 
 def exp_sort_key(k: str) -> Tuple[int, float, str]:
@@ -461,6 +566,7 @@ class ItemBuilder:
         self,
         exts: Tuple[str, ...] = READABLE_EXTS,
         dataset_type: str = DEFAULT_DATASET_TYPE,
+        condition_index: Optional[Dict[str, Set[str]]] = None,
     ) -> None:
         self.exts = tuple(e.lower() for e in exts)
         self.dataset_type = dataset_type or DEFAULT_DATASET_TYPE
@@ -471,6 +577,15 @@ class ItemBuilder:
         self.cmeta: Dict[str, Dict[str, Optional[str]]] = {}
         self.vehicles_csv: Optional[str] = None
         self.conditions_csv: Optional[str] = None
+        # 工况 → 指标名集合。调用方从库里带进来；没有也能跑，只是少一层依据。
+        self.condition_index: Dict[str, Set[str]] = {
+            k: set(v) for k, v in (condition_index or {}).items()
+        }
+        # 文件名本身就算已知工况的那些（conditions.csv / 库里已有的）
+        self.known_conditions: Set[str] = set(self.condition_index)
+        # 靠内容改判过的文件，result() 里回给调用方做提示
+        self.inferred: List[Dict[str, str]] = []
+        self.unresolved: List[Dict[str, str]] = []
 
     def add(self, relpath: str, raw: bytes) -> None:
         rel = relpath
@@ -486,6 +601,8 @@ class ItemBuilder:
         if low in CONDITIONS_CSV_NAMES:
             self.cmeta = read_conditions_csv(raw)
             self.conditions_csv = rel
+            # CSV 里列出的工况名，等同于「已知工况」
+            self.known_conditions |= set(self.cmeta)
             return
         if not low.endswith(self.exts):
             self.skipped.append(rel)
@@ -501,7 +618,9 @@ class ItemBuilder:
 
         folder, folder_order = split_vehicle_folder(parts[0])
         mode = "/".join(parts[1:-1]) or None
-        condition = strip_ext(base, self.exts)
+        # 文件名只是「候选工况」，最终归属在 result() 里定：
+        # 文件名命中已知工况就用它，否则靠内容里的指标名反推。
+        stem = strip_ext(base, self.exts)
 
         try:
             obj = load_data_bytes(raw, base)
@@ -526,15 +645,64 @@ class ItemBuilder:
             "vehicle": folder,
             "folder_order": folder_order,
             "mode": mode,
-            "condition": condition,
+            "condition": stem,
             "file": rel,
             "dataset_type": self.dataset_type,
             "kind": kind,
             "experiments": experiments,
             "payload": payload,
+            # 内部字段，result() 用完就删
+            "_stem": stem,
+            "_metrics": collect_metric_names(experiments),
         })
 
+    def _resolve_conditions(self) -> None:
+        """给每份文件定工况。
+
+        两轮：
+        1. 文件名能对上已知工况（完全相等，或文件名里含工况名，如
+           ``20241021_角阶跃-高速_001``）→ 采信文件名，并把这份数据的
+           指标名并进索引，让后面的文件有更多依据；
+        2. 剩下的靠指标名重合度反推。认不出就保留原文件名 —— 不猜。
+        """
+        index = {k: set(v) for k, v in self.condition_index.items()}
+        known = set(self.known_conditions) | set(index)
+
+        for it in self.items:
+            stem = it["_stem"]
+            hit = stem if stem in known else match_condition_by_name(stem, known)
+            if hit:
+                it["condition"] = hit
+                it["_by"] = "filename"
+                index.setdefault(hit, set()).update(it["_metrics"])
+
+        for it in self.items:
+            if it.get("_by"):
+                continue
+            guess = infer_condition(it["_metrics"], index)
+            if guess:
+                it["condition"] = guess
+                it["_by"] = "content"
+                self.inferred.append({
+                    "file": it["file"], "filename": it["_stem"], "condition": guess,
+                })
+            else:
+                it["_by"] = "filename-raw"
+                self.unresolved.append({
+                    "file": it["file"],
+                    "filename": it["_stem"],
+                    # 认不出时把最像的几个候选带上，用户照着改文件名即可
+                    "candidates": [
+                        c for _s, c in rank_conditions(it["_metrics"], index)
+                    ],
+                })
+
     def result(self) -> Dict[str, Any]:
+        self._resolve_conditions()
+        for it in self.items:
+            it.pop("_stem", None)
+            it.pop("_metrics", None)
+            it.pop("_by", None)
         return {
             "items": self.items,
             "errors": self.errors,
@@ -543,6 +711,8 @@ class ItemBuilder:
             "cmeta": self.cmeta,
             "vehicles_csv": self.vehicles_csv,
             "conditions_csv": self.conditions_csv,
+            "inferred_conditions": self.inferred,
+            "unresolved_conditions": self.unresolved,
         }
 
 
@@ -550,10 +720,11 @@ def build_items(
     entries: Iterable[Tuple[str, bytes]],
     exts: Tuple[str, ...] = READABLE_EXTS,
     dataset_type: str = DEFAULT_DATASET_TYPE,
+    condition_index: Optional[Dict[str, Set[str]]] = None,
 ) -> Dict[str, Any]:
     pairs = list(entries)
     rels = prepare_paths([p for p, _ in pairs])
-    b = ItemBuilder(exts, dataset_type=dataset_type)
+    b = ItemBuilder(exts, dataset_type=dataset_type, condition_index=condition_index)
     for rel, (_, raw) in zip(rels, pairs):
         b.add(rel, raw)
     return b.result()
@@ -563,6 +734,7 @@ def scan_dir(
     data_dir: str,
     exts: Tuple[str, ...] = READABLE_EXTS,
     dataset_type: str = DEFAULT_DATASET_TYPE,
+    condition_index: Optional[Dict[str, Set[str]]] = None,
 ) -> Dict[str, Any]:
     if not os.path.isdir(data_dir):
         raise SystemExit("数据目录不存在: %s" % data_dir)
@@ -573,7 +745,10 @@ def scan_dir(
             full = os.path.join(root, fn)
             rel = os.path.relpath(full, data_dir).replace("\\", "/")
             entries.append((rel, _read_bytes(full)))
-    return build_items(entries, exts=exts, dataset_type=dataset_type)
+    return build_items(
+        entries, exts=exts, dataset_type=dataset_type,
+        condition_index=condition_index,
+    )
 
 
 def _read_bytes(path: str) -> bytes:

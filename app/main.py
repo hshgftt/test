@@ -28,6 +28,7 @@ import time
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from fastapi import (
@@ -48,7 +49,7 @@ from starlette.responses import StreamingResponse
 
 from app import crud, importer
 from app.config import IS_SQLITE, describe
-from app.database import SessionLocal, get_db
+from app.database import SessionLocal, describe_failure, get_db, probe
 from app.schemas import (
     AttrDefIn,
     AttrDefUpdate,
@@ -84,10 +85,24 @@ def json_response(obj: Any, timer: Optional[Timer] = None) -> Response:
     return Response(content=content, media_type="application/json")
 
 
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """启动时真实连一次库。
+
+    不连的话错误只会在每个请求里炸出来，而且被 psycopg2 的编码问题
+    盖成一句 UnicodeDecodeError —— 见 database.py 里的说明。
+    """
+    ok, reason = probe()
+    if not ok:
+        print(describe_failure(reason), flush=True)
+    yield
+
+
 app = FastAPI(
     title="车辆试验数据管理 API",
     description="元数据驱动：车辆字段、导航树层级、数据格式均可配置扩展",
     version="4.0.0",
+    lifespan=_lifespan,
 )
 
 app.add_middleware(
@@ -695,6 +710,11 @@ def upload_data(
     中间目录都是试验模式（可以多层，按 ``/`` 拼接），不同车辆的模式数量不固定。
     车名文件夹可带单号：``极光EV-01(CS-2024-001)``。
 
+    **文件名不必是工况名。** 判定顺序：文件名完全等于已知工况 → 文件名
+    包含已知工况（取最长匹配）→ 按内容里的指标名反推 → 都不行就用文件名。
+    响应里的 ``inferred_conditions`` / ``unresolved_conditions`` 会说明哪些
+    文件是改判的、哪些定不下来（附带候选）。
+
     ``vehicles.csv`` 的列按字段 ``code`` 或 ``name`` 匹配，匹配不到的列会
     自动注册成新的车辆字段，不需要提前建表/加字段。
     """
@@ -717,7 +737,21 @@ def upload_data(
     t = Timer("upload")
     limit = MAX_UPLOAD_MB * 1024 * 1024
     total_bytes = 0
-    builder = importer.ItemBuilder(exts_tuple, dataset_type=dataset_type)
+
+    # 工况索引：从库里已有数据反推「工况 → 指标名」，供文件名不可靠时用。
+    # 必须在 reset_schema 之前取 —— 全量重导时正是靠上一版数据来认工况。
+    with t.stage("index"):
+        _idx_db = SessionLocal()
+        try:
+            condition_index = importer.build_condition_index(_idx_db)
+        finally:
+            _idx_db.close()
+
+    builder = importer.ItemBuilder(
+        exts_tuple,
+        dataset_type=dataset_type,
+        condition_index=condition_index,
+    )
 
     with t.stage("parse"):
         for rel, f in zip(rels, files):
@@ -761,6 +795,10 @@ def upload_data(
         "error_count": len(meta["errors"]),
         "skipped": meta["skipped"][:50],
         "skipped_count": len(meta["skipped"]),
+        # 文件名不可靠时靠内容改判的工况，回给前端提示
+        "inferred_conditions": (meta.get("inferred_conditions") or [])[:50],
+        "inferred_count": len(meta.get("inferred_conditions") or []),
+        "unresolved_conditions": (meta.get("unresolved_conditions") or [])[:50],
     }
     if dry_run:
         t.finish(files=len(files), dry_run=True)
@@ -790,6 +828,12 @@ def upload_data(
 @app.get("/api/health", summary="健康检查", tags=["辅助"])
 def health():
     return {"status": "ok", "database": describe(), "sqlite": IS_SQLITE}
+
+
+@app.get("/health", include_in_schema=False)
+def health_alias():
+    """``/health`` 别名 —— 前端/探针习惯用不带 /api 前缀的路径。"""
+    return health()
 
 
 if __name__ == "__main__":
