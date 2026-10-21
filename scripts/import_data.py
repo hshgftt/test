@@ -161,9 +161,14 @@ def main() -> int:
     if args.dry_run:
         print("\n--dry-run：未写库。样例：")
         it = items[0]
-        print("  %s / %s → 实验号 %s"
-              % (it["vehicle"], it["condition"],
-                 [e for e in sorted(it["payload"], key=importer.exp_sort_key)]))
+        label = it["vehicle"] + (" / " + it["mode"] if it.get("mode") else "")
+        if it["kind"] == "payload":
+            print("  %s / %s → 未知格式，整块存入 datasets.payload"
+                  % (label, it["condition"]))
+        else:
+            print("  %s / %s → 实验号 %s"
+                  % (label, it["condition"],
+                     [e for e in sorted(it["experiments"], key=importer.exp_sort_key)]))
         return 0
 
     # ── 建表 / 清空 ──
@@ -184,8 +189,12 @@ def main() -> int:
         db.close()
 
     print("\n导入完成：%d 份文件，用时 %.1fs" % (stats["files"], time.time() - t0))
-    print("  平台 %d / 品牌 %d / 车型 %d / 工况 %d"
-          % (stats["platforms"], stats["brands"], stats["vehicles"], stats["conditions"]))
+    print("  车辆 %d 台 / 模式 %d 种 / 工况 %d 个 / 数据集 %d 条"
+          % (stats["vehicles"], stats["modes"], stats["conditions"],
+             stats["datasets"]))
+    print("  指标 %d 行 / 曲线 %d 条 / 采样点 %s"
+          % (stats["indicators"], stats["curves"],
+             "{:,}".format(stats["points"])))
     n = importer.recalc_curve_meta()
     if n:
         print("  重算 point_count: %d 条" % n)
