@@ -137,7 +137,7 @@ class DimEntry(Base):
     __tablename__ = "dim_entries"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    dim_code: Mapped[str] = mapped_column(String(50), index=True)
+    dim_code: Mapped[str] = mapped_column(String(50))
     name: Mapped[str] = mapped_column(String(100))
     parent_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("dim_entries.id", ondelete="CASCADE"), index=True,
@@ -258,10 +258,10 @@ class VehicleAttrValue(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     vehicle_id: Mapped[int] = mapped_column(
-        ForeignKey("vehicles.id", ondelete="CASCADE"), index=True,
+        ForeignKey("vehicles.id", ondelete="CASCADE"),
     )
     attr_id: Mapped[int] = mapped_column(
-        ForeignKey("attr_defs.id", ondelete="CASCADE"), index=True,
+        ForeignKey("attr_defs.id", ondelete="CASCADE"),
     )
     value_text: Mapped[Optional[str]] = mapped_column(String(500))
     value_num: Mapped[Optional[float]] = mapped_column(Float)
@@ -296,7 +296,7 @@ class VehicleMode(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     vehicle_id: Mapped[int] = mapped_column(
-        ForeignKey("vehicles.id", ondelete="CASCADE"), index=True,
+        ForeignKey("vehicles.id", ondelete="CASCADE"),
     )
     mode: Mapped[str] = mapped_column(String(50))
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
@@ -322,7 +322,7 @@ class TestOrder(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     vehicle_id: Mapped[int] = mapped_column(
-        ForeignKey("vehicles.id", ondelete="CASCADE"), index=True,
+        ForeignKey("vehicles.id", ondelete="CASCADE"),
     )
     discipline: Mapped[str] = mapped_column(String(20), default="操稳")   # 操稳 / 平顺
     order_no: Mapped[str] = mapped_column(String(100))
@@ -365,7 +365,7 @@ class Dataset(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     vehicle_id: Mapped[int] = mapped_column(
-        ForeignKey("vehicles.id", ondelete="CASCADE"), index=True,
+        ForeignKey("vehicles.id", ondelete="CASCADE"),
     )
     mode_id: Mapped[Optional[int]] = mapped_column(
         ForeignKey("vehicle_modes.id", ondelete="SET NULL"), index=True,
@@ -374,10 +374,10 @@ class Dataset(Base):
         ForeignKey("test_orders.id", ondelete="SET NULL"), index=True,
     )
     condition_id: Mapped[int] = mapped_column(
-        ForeignKey("conditions.id"), index=True,
+        ForeignKey("conditions.id"),
     )
     dataset_type_id: Mapped[int] = mapped_column(
-        ForeignKey("dataset_types.id"), index=True,
+        ForeignKey("dataset_types.id"),
     )
     name: Mapped[str] = mapped_column(String(300))                     # 文件 / 数据集名
     exp_no: Mapped[str] = mapped_column(String(20), default="1")       # '1' / '2' / '平均'
@@ -405,8 +405,12 @@ class Dataset(Base):
             "vehicle_id", "mode_id", "condition_id", "dataset_type_id",
             "name", "exp_no", name="uq_dataset_slot",
         ),
-        Index("ix_datasets_vehicle_condition", "vehicle_id", "condition_id"),
-        Index("ix_datasets_condition_type", "condition_id", "dataset_type_id"),
+        # 单车详情 / 重导时按车 × 工况取数，并保证实验顺序
+        Index("ix_datasets_vehicle_condition_sort",
+              "vehicle_id", "condition_id", "sort_order"),
+        # 对比取数的主路径：先收敛工况 + 数据格式，再按车 / 模式取
+        Index("ix_datasets_compare",
+              "condition_id", "dataset_type_id", "vehicle_id", "mode_id"),
     )
 
 
@@ -415,13 +419,19 @@ class MetricValue(Base):
 
     指标名 / 单位 / raw_key 的规则沿用旧版：``raw_key`` 原样保留，
     数字前缀（``'13-'``）不入库、不排序。
+
+    两条热路径各配一个复合索引：
+
+    * 单车/对比取数：``dataset_id + name``（也支撑 dataset_id 前缀查询）
+    * 跨车指标统计：``name + dataset_id``（先按指标名收敛，再回连数据集）
+    * 按原始 key 精确查：``dataset_id + raw_key``（旧版保留项）
     """
 
     __tablename__ = "metric_values"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     dataset_id: Mapped[int] = mapped_column(
-        ForeignKey("datasets.id", ondelete="CASCADE"), index=True,
+        ForeignKey("datasets.id", ondelete="CASCADE"),
     )
     name: Mapped[str] = mapped_column(String(200))                      # 指标名
     unit: Mapped[Optional[str]] = mapped_column(String(50))            # 单位
@@ -435,7 +445,8 @@ class MetricValue(Base):
 
     __table_args__ = (
         Index("ix_metric_values_dataset_name", "dataset_id", "name"),
-        Index("ix_metric_values_name", "name"),
+        Index("ix_metric_values_dataset_raw", "dataset_id", "raw_key"),
+        Index("ix_metric_values_name_dataset", "name", "dataset_id"),
     )
 
 
