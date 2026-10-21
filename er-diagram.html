@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>车辆操稳试验数据 — ER 图</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f5f5f5; padding: 40px 20px; color: #333;
+  }
+  h1 { text-align: center; font-size: 24px; margin-bottom: 6px; }
+  .subtitle { text-align: center; color: #888; margin-bottom: 36px; font-size: 14px; }
+  .diagram { max-width: 1180px; margin: 0 auto; }
+  .row { display: flex; justify-content: center; gap: 26px; flex-wrap: wrap; margin-bottom: 26px; }
+  .table-card {
+    background: #fff; border-radius: 10px; overflow: hidden;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.08); min-width: 250px; flex-shrink: 0;
+  }
+  .table-card .header {
+    padding: 11px 16px; font-weight: 700; font-size: 15px; color: #fff;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .table-card .header .tag {
+    font-size: 11px; background: rgba(255,255,255,0.25);
+    padding: 2px 8px; border-radius: 10px; margin-left: auto;
+  }
+  .table-card table { width: 100%; border-collapse: collapse; }
+  .table-card td {
+    padding: 6px 16px; font-size: 12.5px; border-bottom: 1px solid #f2f2f2;
+    font-family: "SF Mono", "Consolas", monospace;
+  }
+  .table-card td .type { color: #aaa; font-size: 11px; float: right; }
+  .badge-pk, .badge-fk { display:inline-block; width:16px; text-align:center; font-size:10px; }
+  .badge-pk { color: #e74c3c; }
+  .badge-fk { color: #0066cc; }
+  td .val { color: #666; font-size: 11px; }
+
+  .header-platforms { background: linear-gradient(135deg, #667eea, #764ba2); }
+  .header-brands { background: linear-gradient(135deg, #f093fb, #f5576c); }
+  .header-vehicles { background: linear-gradient(135deg, #4facfe, #00f2fe); }
+  .header-conditions { background: linear-gradient(135deg, #43e97b, #38f9d7); }
+  .header-experiments { background: linear-gradient(135deg, #fa709a, #fee140); }
+  .header-indicators { background: linear-gradient(135deg, #a18cd1, #fbc2eb); }
+  .header-curves { background: linear-gradient(135deg, #ff9a9e, #fad0c4); }
+
+  .connector { text-align: center; color: #bbb; font-size: 26px; margin: -8px 0; user-select: none; }
+  .note {
+    max-width: 1180px; margin: 26px auto; background: #fff; border-radius: 10px;
+    padding: 20px 24px; box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+  }
+  .note h3 { font-size: 14px; margin-bottom: 12px; color: #555; }
+  .note p { font-size: 13px; line-height: 2; color: #444; }
+  .note code {
+    background: #f5f5f5; padding: 2px 6px; border-radius: 3px;
+    font-family: "SF Mono", monospace; font-size: 12px; color: #c0392b;
+  }
+  .legend-items { display: flex; gap: 22px; flex-wrap: wrap; font-size: 13px; }
+  .legend-dot { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+</style>
+</head>
+<body>
+  <h1>车辆操稳试验数据 — 数据库 ER 图</h1>
+  <p class="subtitle">FastAPI + SQLAlchemy 2.0 + PostgreSQL · 7 张表</p>
+
+  <div class="diagram">
+    <!-- Layer 1 -->
+    <div class="row">
+      <div class="table-card">
+        <div class="header header-platforms"><span>🏷️</span> platforms<span class="tag">维度</span></div>
+        <table>
+          <tr><td><span class="badge-pk">🔑</span> id</td><td><span class="type">PK</span></td></tr>
+          <tr><td>name</td><td><span class="type">varchar UQ</span></td></tr>
+          <tr><td>created_at</td><td><span class="type">timestamptz</span></td></tr>
+        </table>
+      </div>
+      <div style="display:flex;align-items:center;color:#bbb;font-size:26px;">→ 1:N →</div>
+      <div class="table-card">
+        <div class="header header-brands"><span>🏢</span> brands<span class="tag">维度</span></div>
+        <table>
+          <tr><td><span class="badge-pk">🔑</span> id</td><td><span class="type">PK</span></td></tr>
+          <tr><td>name</td><td><span class="type">varchar</span></td></tr>
+          <tr><td><span class="badge-fk">🔗</span> platform_id</td><td><span class="type">FK</span></td></tr>
+          <tr><td>created_at</td><td><span class="type">timestamptz</span></td></tr>
+        </table>
+      </div>
+      <div style="display:flex;align-items:center;color:#bbb;font-size:26px;">→ 1:N →</div>
+      <div class="table-card">
+        <div class="header header-vehicles"><span>🚗</span> vehicles<span class="tag">维度</span></div>
+        <table>
+          <tr><td><span class="badge-pk">🔑</span> id</td><td><span class="type">PK</span></td></tr>
+          <tr><td>name</td><td><span class="type">varchar</span></td></tr>
+          <tr><td><span class="badge-fk">🔗</span> brand_id</td><td><span class="type">FK</span></td></tr>
+          <tr><td>drive_type</td><td><span class="type">varchar</span></td></tr>
+          <tr><td>vin</td><td><span class="type">varchar</span></td></tr>
+          <tr><td>model_year</td><td><span class="type">int</span></td></tr>
+          <tr><td>extra_attrs</td><td><span class="type" style="color:#c0392b">JSONB</span></td></tr>
+          <tr><td>created_at</td><td><span class="type">timestamptz</span></td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="connector">↓ 1:N</div>
+
+    <!-- Layer 2 -->
+    <div class="row">
+      <div class="table-card" style="min-width:300px">
+        <div class="header header-experiments"><span>🧪</span> experiments<span class="tag">事实表</span></div>
+        <table>
+          <tr><td><span class="badge-pk">🔑</span> id</td><td><span class="type">PK</span></td></tr>
+          <tr><td><span class="badge-fk">🔗</span> vehicle_id</td><td><span class="type">FK</span></td></tr>
+          <tr><td><span class="badge-fk">🔗</span> condition_id</td><td><span class="type">FK</span></td></tr>
+          <tr><td>experiment_no</td><td><span class="type">varchar <span class="val">'1'/'平均'</span></span></td></tr>
+          <tr><td>is_average</td><td><span class="type">bool</span></td></tr>
+          <tr><td>sort_order</td><td><span class="type">int <span class="val">平均=999</span></span></td></tr>
+          <tr><td>created_at</td><td><span class="type">timestamptz</span></td></tr>
+        </table>
+      </div>
+      <div style="display:flex;align-items:center;color:#bbb;font-size:26px;">← N:1 →</div>
+      <div class="table-card">
+        <div class="header header-conditions"><span>📋</span> conditions<span class="tag">维度</span></div>
+        <table>
+          <tr><td><span class="badge-pk">🔑</span> id</td><td><span class="type">PK</span></td></tr>
+          <tr><td>name</td><td><span class="type">varchar UQ</span></td></tr>
+          <tr><td>description</td><td><span class="type">text</span></td></tr>
+          <tr><td>category</td><td><span class="type">varchar</span></td></tr>
+          <tr><td>created_at</td><td><span class="type">timestamptz</span></td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="connector">↓ 1:N (CASCADE)</div>
+
+    <!-- Layer 3 -->
+    <div class="row">
+      <div class="table-card" style="min-width:330px">
+        <div class="header header-indicators"><span>📊</span> indicators<span class="tag">EAV 行</span></div>
+        <table>
+          <tr><td><span class="badge-pk">🔑</span> id</td><td><span class="type">PK</span></td></tr>
+          <tr><td><span class="badge-fk">🔗</span> experiment_id</td><td><span class="type">FK</span></td></tr>
+          <tr><td>seq</td><td><span class="type">int <span class="val">序号 10,11…</span></span></td></tr>
+          <tr><td>name</td><td><span class="type">varchar idx</span></td></tr>
+          <tr><td>unit</td><td><span class="type">varchar <span class="val">km/h, g…</span></span></td></tr>
+          <tr><td>raw_key</td><td><span class="type">varchar <span class="val">'13-侧向加速度稳态值(g)'</span></span></td></tr>
+          <tr><td>value</td><td><span class="type">float</span></td></tr>
+          <tr><td>text_value</td><td><span class="type">varchar</span></td></tr>
+          <tr><td>category</td><td><span class="type">varchar</span></td></tr>
+          <tr><td>created_at</td><td><span class="type">timestamptz</span></td></tr>
+        </table>
+      </div>
+      <div style="display:flex;align-items:center;color:#bbb;font-size:19px;flex-direction:column;gap:4px;">
+        <span>1 : N</span><span style="font-size:11px;color:#999;">(同一 experiment)</span>
+      </div>
+      <div class="table-card" style="min-width:330px">
+        <div class="header header-curves"><span>📈</span> curves<span class="tag">JSONB</span></div>
+        <table>
+          <tr><td><span class="badge-pk">🔑</span> id</td><td><span class="type">PK</span></td></tr>
+          <tr><td><span class="badge-fk">🔗</span> experiment_id</td><td><span class="type">FK</span></td></tr>
+          <tr><td>group</td><td><span class="type">varchar <span class="val">'cal' | 'duiqi'</span></span></td></tr>
+          <tr><td>name</td><td><span class="type">varchar <span class="val">'方向盘转角-时间'</span></span></td></tr>
+          <tr><td>title</td><td><span class="type">varchar</span></td></tr>
+          <tr><td>xlabel</td><td><span class="type">varchar</span></td></tr>
+          <tr><td>ylabel</td><td><span class="type">varchar</span></td></tr>
+          <tr><td>series</td><td><span class="type" style="color:#c0392b">JSONB</span></td></tr>
+          <tr><td>sort_order</td><td><span class="type">int</span></td></tr>
+          <tr><td>created_at</td><td><span class="type">timestamptz</span></td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="note">
+    <h3>图例</h3>
+    <div class="legend-items">
+      <div><span class="badge-pk">🔑</span> Primary Key</div>
+      <div><span class="badge-fk">🔗</span> Foreign Key</div>
+      <div><span class="legend-dot" style="background:#c0392b;"></span> JSONB 列</div>
+    </div>
+  </div>
+
+  <div class="note">
+    <h3>设计要点</h3>
+    <p>
+      <b>① 指标 EAV 行存储</b> — 不为每个指标名建字段。原始 key
+      <code>'13-侧向加速度稳态值(g)'</code> 拆为 <code>seq=13</code> /
+      <code>name=侧向加速度稳态值</code> / <code>unit=g</code>，同时保留
+      <code>raw_key</code> 无损还原。<b>注意 seq 会重复</b>（如两个指标同为 17），
+      故 <code>raw_key</code> 才是唯一标识。新指标 = INSERT 一行，零 migration。
+    </p>
+    <p>
+      <b>② 曲线 JSONB 整行存储</b> — 前端「只会全拿出来绘制，不会查到 y」，
+      故 <code>series</code>（含 x/y/curvetype/curvename）整块存 JSONB，一次读取拿全，不拆表。
+      每次实验有 <code>curves_cal</code>（原始+滤波）和 <code>curves_duiqi</code>（对齐后）两组。
+    </p>
+    <p>
+      <b>③ 实验号用字符串</b> — <code>experiment_no</code> 存 <code>'1'/'2'/'平均'</code>，
+      配合 <code>is_average</code> + <code>sort_order</code>（平均=999）保证：
+      数字实验在前，平均在最后。各车实验次数可不固定（2~3 次）。
+    </p>
+    <p>
+      <b>④ 车辆属性 固定列 + JSONB</b> — 常用属性（drive_type/vin/model_year）走固定列，
+      扩展属性放 <code>extra_attrs</code> JSONB，零 migration。
+    </p>
+    <p>
+      <b>⑤ 级联删除</b> — 所有 FK 设 <code>ON DELETE CASCADE</code>，删车自动清实验/指标/曲线。
+    </p>
+  </div>
+</body>
+</html>
